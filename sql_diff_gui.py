@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import traceback
+from zipfile import BadZipFile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
@@ -24,17 +25,38 @@ def normalize_sql(value: object, ignore_whitespace: bool = True) -> str:
     return text
 
 
+def clean_col_name(value: object) -> str:
+    return str(value).replace("\n", "").replace("\r", "").replace(" ", "").strip()
+
+
 def load_excel(file_path: str) -> pd.DataFrame:
     suffix = Path(file_path).suffix.lower()
-    if suffix not in {".xlsx", ".xls"}:
-        raise ValueError(f"不支持的文件类型: {suffix}")
+    if suffix == ".xlsx":
+        return pd.read_excel(file_path, engine="openpyxl", header=None)
+    if suffix == ".xlsm":
+        return pd.read_excel(file_path, engine="openpyxl", header=None)
+    if suffix == ".xls":
+        try:
+            return pd.read_excel(file_path, engine="xlrd", header=None)
+        except Exception:
+            tables = pd.read_html(file_path, header=None)
+            return tables[0]
 
-    return pd.read_excel(file_path)
+    raise ValueError(f"不支持的文件类型: {suffix}")
 
 
-def ensure_sql_column(df: pd.DataFrame, file_label: str) -> None:
-    if SQL_COLUMN_NAME not in df.columns:
-        raise ValueError(f"{file_label} 中未找到表头 “{SQL_COLUMN_NAME}”")
+def fix_header(df: pd.DataFrame, target_col: str = SQL_COLUMN_NAME) -> pd.DataFrame:
+    target = clean_col_name(target_col)
+
+    for i in range(min(30, len(df))):
+        row = [clean_col_name(x) for x in df.iloc[i].tolist()]
+        if target in row:
+            new_df = df.iloc[i + 1 :].copy()
+            new_df.columns = row
+            new_df.reset_index(drop=True, inplace=True)
+            return new_df
+
+    raise ValueError(f"没有找到表头 “{target_col}”")
 
 
 def build_sql_map(
@@ -67,14 +89,17 @@ def compare_sql_files(
     file2: str,
     output_dir: str,
     ignore_whitespace: bool = True,
-) -> str:
+) -> Tuple[str, Dict[str, int]]:
     os.makedirs(output_dir, exist_ok=True)
 
     df1 = load_excel(file1)
     df2 = load_excel(file2)
 
-    ensure_sql_column(df1, "表1")
-    ensure_sql_column(df2, "表2")
+    df1 = fix_header(df1, SQL_COLUMN_NAME)
+    df2 = fix_header(df2, SQL_COLUMN_NAME)
+
+    df1 = df1[df1[SQL_COLUMN_NAME].notna()].copy()
+    df2 = df2[df2[SQL_COLUMN_NAME].notna()].copy()
 
     map1, order1 = build_sql_map(df1, ignore_whitespace)
     map2, order2 = build_sql_map(df2, ignore_whitespace)
@@ -92,16 +117,29 @@ def compare_sql_files(
     both1_df = build_dataframe_from_rows((map1[key] for key in both1_keys), df1.columns)
     both2_df = build_dataframe_from_rows((map2[key] for key in both2_keys), df2.columns)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(output_dir, f"SQL比较结果_{timestamp}.xlsx")
+    name1 = Path(file1).stem
+    name2 = Path(file2).stem
+    output_path = os.path.join(output_dir, f"SQL比较结果_{name1}_VS_{name2}.xlsx")
+
+    sheet_only1 = f"仅{name1}"[:31]
+    sheet_only2 = f"仅{name2}"[:31]
+    sheet_both1 = f"共有({name1})"[:31]
+    sheet_both2 = f"共有({name2})"[:31]
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        only1_df.to_excel(writer, sheet_name="表1不在表2", index=False)
-        only2_df.to_excel(writer, sheet_name="表2不在表1", index=False)
-        both1_df.to_excel(writer, sheet_name="两个表都有_表1格式", index=False)
-        both2_df.to_excel(writer, sheet_name="两个表都有_表2格式", index=False)
+        only1_df.to_excel(writer, sheet_name=sheet_only1, index=False)
+        only2_df.to_excel(writer, sheet_name=sheet_only2, index=False)
+        both1_df.to_excel(writer, sheet_name=sheet_both1, index=False)
+        both2_df.to_excel(writer, sheet_name=sheet_both2, index=False)
 
-    return output_path
+    stats = {
+        "表1总数": len(map1),
+        "表2总数": len(map2),
+        "仅表1": len(only1_df),
+        "仅表2": len(only2_df),
+        "共有": len(both1_keys),
+    }
+    return output_path, stats
 
 
 class SqlDiffApp:
@@ -206,7 +244,7 @@ class SqlDiffApp:
     def _select_excel_file(self) -> str:
         return filedialog.askopenfilename(
             title="选择 Excel 文件",
-            filetypes=[("Excel 文件", "*.xlsx *.xls"), ("所有文件", "*.*")],
+            filetypes=[("Excel 文件", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")],
         )
 
     def run_compare(self) -> None:
@@ -226,12 +264,20 @@ class SqlDiffApp:
         self.root.update_idletasks()
 
         try:
-            output_path = compare_sql_files(
+            output_path, stats = compare_sql_files(
                 file1=file1,
                 file2=file2,
                 output_dir=output_dir,
                 ignore_whitespace=self.ignore_whitespace_var.get(),
             )
+        except BadZipFile:
+            msg = (
+                "文件扩展名看起来像 Excel，但文件内容不是标准的 .xlsx/.xlsm 格式。\n"
+                "请确认不是把 CSV、截图导出文件或临时文件误当成 Excel 选进来了。"
+            )
+            self.status_var.set(f"比较失败：{msg}")
+            messagebox.showerror("比较失败", msg)
+            return
         except Exception as exc:
             self.status_var.set(f"比较失败：{exc}")
             traceback.print_exc()
@@ -241,11 +287,16 @@ class SqlDiffApp:
         self.status_var.set(
             "比较完成。\n"
             f"结果文件：{output_path}\n\n"
+            f"表1总数：{stats['表1总数']}\n"
+            f"表2总数：{stats['表2总数']}\n"
+            f"仅表1：{stats['仅表1']}\n"
+            f"仅表2：{stats['仅表2']}\n"
+            f"共有：{stats['共有']}\n\n"
             "生成内容：\n"
-            "1. 表1不在表2\n"
-            "2. 表2不在表1\n"
-            "3. 两个表都有_表1格式\n"
-            "4. 两个表都有_表2格式"
+            f"1. 仅{Path(file1).stem}\n"
+            f"2. 仅{Path(file2).stem}\n"
+            f"3. 共有({Path(file1).stem})\n"
+            f"4. 共有({Path(file2).stem})"
         )
         messagebox.showinfo("比较完成", f"结果已生成：\n{output_path}")
 
