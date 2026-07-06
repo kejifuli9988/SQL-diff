@@ -371,6 +371,7 @@ class SqlDiffApp:
 
         ttk.Button(button_frame, text="开始比较", command=self.run_compare).pack(side="left")
         ttk.Button(button_frame, text="打开输出目录", command=self.open_output_dir).pack(side="left", padx=(12, 0))
+        ttk.Button(button_frame, text="规则说明", command=self.show_rules).pack(side="left", padx=(12, 0))
 
         status_title = ttk.Label(frame, text="运行状态", font=("Microsoft YaHei UI", 10, "bold"))
         status_title.pack(anchor="w", pady=(8, 6))
@@ -508,6 +509,29 @@ class SqlDiffApp:
             os.system(f'open "{path}"')
         else:
             os.system(f'xdg-open "{path}"')
+
+    def show_rules(self) -> None:
+        message = (
+            "一、SQL 比较规则\n"
+            "1. 以“SQL语句”列作为比较依据。\n"
+            "2. 程序会自动在前 30 行里寻找真正表头，不要求第一行就是表头。\n"
+            "3. 支持标准 .xlsx / .xlsm / .xls；对部分伪装成 .xls 的 HTML 表格也会尝试兼容读取。\n"
+            "4. 同一个文件中，如果同一条 SQL 重复出现，只保留首次出现的那一行参与主比较。\n"
+            "5. “忽略空白差异”勾选后，会忽略换行、多个空格和首尾空格；不勾选时按原始 SQL 比较。\n\n"
+            "二、相似 SQL 归类规则\n"
+            "1. 相似归类不是按业务语义，而是按标准化后的 SQL 骨架分组。\n"
+            "2. 归类时会统一大小写和空白格式。\n"
+            "3. 字符串常量会替换成 ?str?。\n"
+            "4. 日期会替换成 ?date?，8 位日期串会替换成 ?date8?。\n"
+            "5. 数字会替换成 ?num?。\n"
+            "6. IN (...) 会折叠成 in(?list?)，VALUES (...) 会折叠成 values(?vals?)。\n"
+            "7. 两条 SQL 标准化后完全一致，才会归到同一个“相似类ID”。\n\n"
+            "三、汇总表字段说明\n"
+            "1. 是否存在完全相同SQL：表示两个表里是否出现过完全一致的原始 SQL。\n"
+            "2. 跨表原因：可能是“完全相同 / 仅日期不同 / IN列表不同 / 仅参数不同 / 结构相似 / 仅单表出现”。\n"
+            "3. 对应表内第几条：显示这一类 SQL 分别出现在各原表里的第几条，方便回原表定位。"
+        )
+        messagebox.showinfo("规则说明", message)
 
 
 def main() -> None:
