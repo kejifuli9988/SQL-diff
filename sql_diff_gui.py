@@ -60,6 +60,62 @@ def build_similarity_signature(sql: str) -> str:
     return s
 
 
+def build_date_only_signature(sql: str) -> str:
+    s = normalize_sql(sql).lower()
+    s = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?: \d{1,2}:\d{1,2}:\d{1,2})?\b", "?date?", s)
+    s = re.sub(r"\b\d{8}\b", "?date8?", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def build_inlist_signature(sql: str) -> str:
+    s = normalize_sql(sql).lower()
+    s = re.sub(r"\bin\s*\((?:[^()]*?)\)", "in(?list?)", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def build_parameter_signature(sql: str) -> str:
+    s = normalize_sql(sql).lower()
+    s = re.sub(r"'(?:''|[^'])*'", "?str?", s)
+    s = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?: \d{1,2}:\d{1,2}:\d{1,2})?\b", "?date?", s)
+    s = re.sub(r"\b\d{8}\b", "?date8?", s)
+    s = re.sub(r"\b\d+\b", "?num?", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def infer_cross_file_reason(grp: pd.DataFrame) -> Tuple[str, str]:
+    if grp["来源文件"].nunique() < 2:
+        return "否", "仅单表出现"
+
+    file_names = list(grp["来源文件"].drop_duplicates())
+    file_a = grp[grp["来源文件"] == file_names[0]]
+    file_b = grp[grp["来源文件"] == file_names[1]]
+
+    exact_a = set(file_a["SQL语句"])
+    exact_b = set(file_b["SQL语句"])
+    if exact_a & exact_b:
+        return "是", "完全相同"
+
+    date_a = set(file_a["日期归一特征"])
+    date_b = set(file_b["日期归一特征"])
+    if date_a & date_b:
+        return "否", "仅日期不同"
+
+    in_a = set(file_a["IN归一特征"])
+    in_b = set(file_b["IN归一特征"])
+    if in_a & in_b:
+        return "否", "IN列表不同"
+
+    param_a = set(file_a["参数归一特征"])
+    param_b = set(file_b["参数归一特征"])
+    if param_a & param_b:
+        return "否", "仅参数不同"
+
+    return "否", "结构相似"
+
+
 def clean_col_name(value: object) -> str:
     return str(value).replace("\n", "").replace("\r", "").replace(" ", "").strip()
 
@@ -135,19 +191,25 @@ def build_similarity_reports(
             sql = normalize_sql(row.get(SQL_COLUMN_NAME))
             if not sql:
                 continue
-            signature = build_similarity_signature(sql)
-            class_id = "C" + hashlib.md5(signature.encode("utf-8")).hexdigest()[:8].upper()
+            strict_signature = build_similarity_signature(sql)
+            date_signature = build_date_only_signature(sql)
+            inlist_signature = build_inlist_signature(sql)
+            parameter_signature = build_parameter_signature(sql)
+            strict_class_id = "S" + hashlib.md5(strict_signature.encode("utf-8")).hexdigest()[:8].upper()
             raw_fingerprint = row.get("指纹", "") if "指纹" in df.columns else ""
             detail_rows.append(
                 {
                     "来源文件": file_name,
                     "对应表内第几条": idx + 1,
                     "原始Excel行号": start_row + idx,
-                    "相似类ID": class_id,
+                    "相似类ID": strict_class_id,
                     "SQL类型": classify_sql(sql),
                     "原表指纹": raw_fingerprint,
                     "SQL语句": sql,
-                    "相似SQL特征": signature,
+                    "相似SQL特征": strict_signature,
+                    "日期归一特征": date_signature,
+                    "IN归一特征": inlist_signature,
+                    "参数归一特征": parameter_signature,
                 }
             )
 
@@ -157,6 +219,7 @@ def build_similarity_reports(
 
     summary_rows = []
     for class_id, grp in detail_df.groupby("相似类ID", sort=False):
+        has_exact_match, cross_reason = infer_cross_file_reason(grp)
         positions = []
         for file_name, sub in grp.groupby("来源文件", sort=False):
             seqs = "、".join(str(x) for x in sub["对应表内第几条"].tolist())
@@ -167,6 +230,9 @@ def build_similarity_reports(
                 "SQL类型": grp["SQL类型"].iloc[0],
                 "重复条数": len(grp),
                 "涉及文件数": grp["来源文件"].nunique(),
+                "是否存在完全相同SQL": has_exact_match,
+                "跨表原因": cross_reason,
+                "来源文件": "、".join(grp["来源文件"].drop_duplicates().tolist()),
                 "对应表内第几条": " | ".join(positions),
                 "代表SQL": grp["SQL语句"].iloc[0],
                 "相似SQL特征": grp["相似SQL特征"].iloc[0],
@@ -231,6 +297,8 @@ def compare_sql_files(
     )
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df1.to_excel(writer, sheet_name=f"原表_{name1}"[:31], index=False)
+        df2.to_excel(writer, sheet_name=f"原表_{name2}"[:31], index=False)
         only1_df.to_excel(writer, sheet_name=sheet_only1, index=False)
         only2_df.to_excel(writer, sheet_name=sheet_only2, index=False)
         both1_df.to_excel(writer, sheet_name=sheet_both1, index=False)
@@ -371,7 +439,18 @@ class SqlDiffApp:
         self.root.update_idletasks()
 
         try:
-            output_path, stats, similarity_summary_df, _ = compare_sql_files(
+            output_name = f"SQL比较结果_{Path(file1).stem}_VS_{Path(file2).stem}.xlsx"
+            output_path = os.path.join(output_dir, output_name)
+            if os.path.exists(output_path):
+                should_overwrite = messagebox.askyesno(
+                    "文件已存在",
+                    f"结果文件已存在：\n{output_path}\n\n是否覆盖？",
+                )
+                if not should_overwrite:
+                    self.status_var.set("已取消生成：存在同名结果文件，且未选择覆盖。")
+                    return
+
+            output_path, stats, _, _ = compare_sql_files(
                 file1=file1,
                 file2=file2,
                 output_dir=output_dir,
@@ -401,12 +480,14 @@ class SqlDiffApp:
             f"共有：{stats['共有']}\n"
             f"相似SQL类数：{stats['相似类数']}\n\n"
             "生成内容：\n"
-            f"1. 仅{Path(file1).stem}\n"
-            f"2. 仅{Path(file2).stem}\n"
-            f"3. 共有({Path(file1).stem})\n"
-            f"4. 共有({Path(file2).stem})\n"
-            "5. 相似SQL归类汇总\n"
-            "6. 相似SQL明细"
+            f"1. 原表_{Path(file1).stem}\n"
+            f"2. 原表_{Path(file2).stem}\n"
+            f"3. 仅{Path(file1).stem}\n"
+            f"4. 仅{Path(file2).stem}\n"
+            f"5. 共有({Path(file1).stem})\n"
+            f"6. 共有({Path(file2).stem})\n"
+            "7. 相似SQL归类汇总\n"
+            "8. 相似SQL明细"
         )
         messagebox.showinfo("比较完成", f"结果已生成：\n{output_path}")
 
