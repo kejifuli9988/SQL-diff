@@ -2,10 +2,10 @@ import os
 import re
 import sys
 import traceback
+import hashlib
 from zipfile import BadZipFile
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
 import tkinter as tk
@@ -23,6 +23,41 @@ def normalize_sql(value: object, ignore_whitespace: bool = True) -> str:
     if ignore_whitespace:
         text = re.sub(r"\s+", " ", text)
     return text
+
+
+def classify_sql(sql: str) -> str:
+    s = normalize_sql(sql).lower()
+    if s.startswith("select count(*) from"):
+        return "COUNT查询"
+    if s.startswith("select * from ( select row_.*, rownum as rownum_ from"):
+        return "分页查询"
+    if s.startswith("select") and " for update" in s:
+        return "SELECT FOR UPDATE"
+    if s.startswith("select"):
+        return "普通SELECT"
+    if s.startswith("insert into"):
+        return "INSERT"
+    if s.startswith("update"):
+        return "UPDATE"
+    if s.startswith("delete from"):
+        return "DELETE"
+    if s.startswith("with"):
+        return "WITH查询"
+    if s.startswith("begin"):
+        return "存储过程/PLSQL"
+    return "其他"
+
+
+def build_similarity_signature(sql: str) -> str:
+    s = normalize_sql(sql).lower()
+    s = re.sub(r"'(?:''|[^'])*'", "?str?", s)
+    s = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?: \d{1,2}:\d{1,2}:\d{1,2})?\b", "?date?", s)
+    s = re.sub(r"\b\d{8}\b", "?date8?", s)
+    s = re.sub(r"\b\d+\b", "?num?", s)
+    s = re.sub(r"\bin\s*\((?:[^()]*?)\)", "in(?list?)", s)
+    s = re.sub(r"\bvalues\s*\((?:[^()]*?)\)", "values(?vals?)", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def clean_col_name(value: object) -> str:
@@ -45,7 +80,7 @@ def load_excel(file_path: str) -> pd.DataFrame:
     raise ValueError(f"不支持的文件类型: {suffix}")
 
 
-def fix_header(df: pd.DataFrame, target_col: str = SQL_COLUMN_NAME) -> pd.DataFrame:
+def fix_header(df: pd.DataFrame, target_col: str = SQL_COLUMN_NAME) -> Tuple[pd.DataFrame, int]:
     target = clean_col_name(target_col)
 
     for i in range(min(30, len(df))):
@@ -54,7 +89,7 @@ def fix_header(df: pd.DataFrame, target_col: str = SQL_COLUMN_NAME) -> pd.DataFr
             new_df = df.iloc[i + 1 :].copy()
             new_df.columns = row
             new_df.reset_index(drop=True, inplace=True)
-            return new_df
+            return new_df, i + 2
 
     raise ValueError(f"没有找到表头 “{target_col}”")
 
@@ -84,19 +119,80 @@ def build_dataframe_from_rows(rows: Iterable[pd.Series], columns: Iterable[str])
     return pd.DataFrame(rows, columns=list(columns))
 
 
+def build_similarity_reports(
+    file1: str,
+    file2: str,
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    start_row1: int,
+    start_row2: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    detail_rows: List[Dict[str, object]] = []
+    files = [(Path(file1).name, df1, start_row1), (Path(file2).name, df2, start_row2)]
+
+    for file_name, df, start_row in files:
+        for idx, row in df.reset_index(drop=True).iterrows():
+            sql = normalize_sql(row.get(SQL_COLUMN_NAME))
+            if not sql:
+                continue
+            signature = build_similarity_signature(sql)
+            class_id = "C" + hashlib.md5(signature.encode("utf-8")).hexdigest()[:8].upper()
+            raw_fingerprint = row.get("指纹", "") if "指纹" in df.columns else ""
+            detail_rows.append(
+                {
+                    "来源文件": file_name,
+                    "对应表内第几条": idx + 1,
+                    "原始Excel行号": start_row + idx,
+                    "相似类ID": class_id,
+                    "SQL类型": classify_sql(sql),
+                    "原表指纹": raw_fingerprint,
+                    "SQL语句": sql,
+                    "相似SQL特征": signature,
+                }
+            )
+
+    detail_df = pd.DataFrame(detail_rows)
+    if detail_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    summary_rows = []
+    for class_id, grp in detail_df.groupby("相似类ID", sort=False):
+        positions = []
+        for file_name, sub in grp.groupby("来源文件", sort=False):
+            seqs = "、".join(str(x) for x in sub["对应表内第几条"].tolist())
+            positions.append(f"{file_name}: {seqs}")
+        summary_rows.append(
+            {
+                "相似类ID": class_id,
+                "SQL类型": grp["SQL类型"].iloc[0],
+                "重复条数": len(grp),
+                "涉及文件数": grp["来源文件"].nunique(),
+                "对应表内第几条": " | ".join(positions),
+                "代表SQL": grp["SQL语句"].iloc[0],
+                "相似SQL特征": grp["相似SQL特征"].iloc[0],
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        ["重复条数", "涉及文件数"],
+        ascending=[False, False],
+    )
+    return summary_df, detail_df
+
+
 def compare_sql_files(
     file1: str,
     file2: str,
     output_dir: str,
     ignore_whitespace: bool = True,
-) -> Tuple[str, Dict[str, int]]:
+) -> Tuple[str, Dict[str, int], pd.DataFrame, pd.DataFrame]:
     os.makedirs(output_dir, exist_ok=True)
 
     df1 = load_excel(file1)
     df2 = load_excel(file2)
 
-    df1 = fix_header(df1, SQL_COLUMN_NAME)
-    df2 = fix_header(df2, SQL_COLUMN_NAME)
+    df1, start_row1 = fix_header(df1, SQL_COLUMN_NAME)
+    df2, start_row2 = fix_header(df2, SQL_COLUMN_NAME)
 
     df1 = df1[df1[SQL_COLUMN_NAME].notna()].copy()
     df2 = df2[df2[SQL_COLUMN_NAME].notna()].copy()
@@ -125,12 +221,22 @@ def compare_sql_files(
     sheet_only2 = f"仅{name2}"[:31]
     sheet_both1 = f"共有({name1})"[:31]
     sheet_both2 = f"共有({name2})"[:31]
+    similarity_summary_df, similarity_detail_df = build_similarity_reports(
+        file1=file1,
+        file2=file2,
+        df1=df1,
+        df2=df2,
+        start_row1=start_row1,
+        start_row2=start_row2,
+    )
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         only1_df.to_excel(writer, sheet_name=sheet_only1, index=False)
         only2_df.to_excel(writer, sheet_name=sheet_only2, index=False)
         both1_df.to_excel(writer, sheet_name=sheet_both1, index=False)
         both2_df.to_excel(writer, sheet_name=sheet_both2, index=False)
+        similarity_summary_df.to_excel(writer, sheet_name="相似SQL归类汇总", index=False)
+        similarity_detail_df.to_excel(writer, sheet_name="相似SQL明细", index=False)
 
     stats = {
         "表1总数": len(map1),
@@ -138,8 +244,9 @@ def compare_sql_files(
         "仅表1": len(only1_df),
         "仅表2": len(only2_df),
         "共有": len(both1_keys),
+        "相似类数": len(similarity_summary_df),
     }
-    return output_path, stats
+    return output_path, stats, similarity_summary_df, similarity_detail_df
 
 
 class SqlDiffApp:
@@ -152,7 +259,7 @@ class SqlDiffApp:
         self.file1_var = tk.StringVar()
         self.file2_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(Path.home() / "Desktop"))
-        self.ignore_whitespace_var = tk.BooleanVar(value=True)
+        self.ignore_whitespace_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="请选择两个 Excel 文件和输出目录。")
 
         self._build_ui()
@@ -244,7 +351,7 @@ class SqlDiffApp:
     def _select_excel_file(self) -> str:
         return filedialog.askopenfilename(
             title="选择 Excel 文件",
-            filetypes=[("Excel 文件", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")],
+            filetypes=[("Excel 文件", "*.xlsx *.xls"), ("所有文件", "*.*")],
         )
 
     def run_compare(self) -> None:
@@ -264,7 +371,7 @@ class SqlDiffApp:
         self.root.update_idletasks()
 
         try:
-            output_path, stats = compare_sql_files(
+            output_path, stats, similarity_summary_df, _ = compare_sql_files(
                 file1=file1,
                 file2=file2,
                 output_dir=output_dir,
@@ -291,12 +398,15 @@ class SqlDiffApp:
             f"表2总数：{stats['表2总数']}\n"
             f"仅表1：{stats['仅表1']}\n"
             f"仅表2：{stats['仅表2']}\n"
-            f"共有：{stats['共有']}\n\n"
+            f"共有：{stats['共有']}\n"
+            f"相似SQL类数：{stats['相似类数']}\n\n"
             "生成内容：\n"
             f"1. 仅{Path(file1).stem}\n"
             f"2. 仅{Path(file2).stem}\n"
             f"3. 共有({Path(file1).stem})\n"
-            f"4. 共有({Path(file2).stem})"
+            f"4. 共有({Path(file2).stem})\n"
+            "5. 相似SQL归类汇总\n"
+            "6. 相似SQL明细"
         )
         messagebox.showinfo("比较完成", f"结果已生成：\n{output_path}")
 
