@@ -3,6 +3,7 @@ import re
 import sys
 import traceback
 import hashlib
+import json
 from zipfile import BadZipFile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -15,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 SQL_COLUMN_NAME = "SQL语句"
 TABLE_STATS_NAME_COLUMN = "表名"
 TABLE_STATS_ROWS_COLUMN = "记录数"
-HISTORY_ENRICH_COLUMNS = [
+DEFAULT_HISTORY_ENRICH_COLUMNS = [
     "服务",
     "大表且暂不优化",
     "大表表名",
@@ -29,6 +30,34 @@ HISTORY_ENRICH_COLUMNS = [
     "备注",
     "表拆分后的平均执行时间",
 ]
+SETTINGS_FILE = Path(__file__).with_name("sql_diff_gui_settings.json")
+
+
+def load_enrich_columns_config() -> List[str]:
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            columns = data.get("history_enrich_columns", [])
+            if isinstance(columns, list):
+                cleaned = []
+                seen: Set[str] = set()
+                for item in columns:
+                    text = str(item).strip()
+                    if text and text not in seen:
+                        seen.add(text)
+                        cleaned.append(text)
+                if cleaned:
+                    return cleaned
+        except Exception:
+            pass
+    return DEFAULT_HISTORY_ENRICH_COLUMNS.copy()
+
+
+def save_enrich_columns_config(columns: List[str]) -> None:
+    SETTINGS_FILE.write_text(
+        json.dumps({"history_enrich_columns": columns}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def normalize_sql(value: object, ignore_whitespace: bool = True) -> str:
@@ -201,6 +230,7 @@ def build_summary_row(
     cross_reason: str,
     has_exact_match: str,
     large_table_map: Optional[Dict[str, int]] = None,
+    enrich_columns: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     positions = []
     for file_name, sub in grp.groupby("来源文件", sort=False):
@@ -216,7 +246,7 @@ def build_summary_row(
                     seen.add(table_name)
                     matched_tables.append(table_name)
 
-    return {
+    summary_row = {
         "相似类ID": class_id,
         "SQL类型": grp["SQL类型"].iloc[0],
         "重复条数": len(grp),
@@ -226,20 +256,12 @@ def build_summary_row(
         "来源文件": "、".join(grp["来源文件"].drop_duplicates().tolist()),
         "对应表内第几条": " | ".join(positions),
         "代表SQL": grp["SQL语句"].iloc[0],
-        "服务": merge_group_values(grp["服务"]) if "服务" in grp.columns else "",
-        "大表且暂不优化": merge_group_values(grp["大表且暂不优化"]) if "大表且暂不优化" in grp.columns else "",
-        "大表表名": merge_group_values(grp["大表表名"]) if "大表表名" in grp.columns else "",
-        "慢SQL分类": merge_group_values(grp["慢SQL分类"]) if "慢SQL分类" in grp.columns else "",
-        "初步优化方案": merge_group_values(grp["初步优化方案"]) if "初步优化方案" in grp.columns else "",
-        "应用场景": merge_group_values(grp["应用场景"]) if "应用场景" in grp.columns else "",
-        "加权分数": merge_group_values(grp["加权分数"]) if "加权分数" in grp.columns else "",
-        "优先级": merge_group_values(grp["优先级"]) if "优先级" in grp.columns else "",
-        "修复时间": merge_group_values(grp["修复时间"]) if "修复时间" in grp.columns else "",
-        "跟进情况": merge_group_values(grp["跟进情况"]) if "跟进情况" in grp.columns else "",
-        "备注": merge_group_values(grp["备注"]) if "备注" in grp.columns else "",
-        "规则判断是否有大表": "是" if matched_tables else "否",
-        "规则判断涉及到的大表名称": "、".join(matched_tables),
     }
+    for col in enrich_columns or []:
+        summary_row[col] = merge_group_values(grp[col]) if col in grp.columns else ""
+    summary_row["规则判断是否有大表"] = "是" if matched_tables else "否"
+    summary_row["规则判断涉及到的大表名称"] = "、".join(matched_tables)
+    return summary_row
 
 
 def clean_col_name(value: object) -> str:
@@ -309,6 +331,7 @@ def build_similarity_reports(
     start_row1: int,
     start_row2: int,
     large_table_map: Optional[Dict[str, int]] = None,
+    enrich_columns: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     detail_rows: List[Dict[str, object]] = []
     files = [(Path(file1).name, df1, start_row1), (Path(file2).name, df2, start_row2)]
@@ -340,7 +363,7 @@ def build_similarity_reports(
                     "SQL涉及表": "、".join(extract_table_names(sql)),
                 }
             )
-            for col in HISTORY_ENRICH_COLUMNS:
+            for col in enrich_columns or []:
                 detail_rows[-1][col] = row.get(col, "") if col in df.columns else ""
 
     detail_df = pd.DataFrame(detail_rows)
@@ -350,7 +373,7 @@ def build_similarity_reports(
     summary_rows = []
     for class_id, grp in detail_df.groupby("相似类ID", sort=False):
         if grp["来源文件"].nunique() < 2:
-            summary_rows.append(build_summary_row(grp, class_id, "仅单表出现", "否", large_table_map))
+            summary_rows.append(build_summary_row(grp, class_id, "仅单表出现", "否", large_table_map, enrich_columns))
             continue
 
         file_names = list(grp["来源文件"].drop_duplicates())
@@ -362,16 +385,16 @@ def build_similarity_reports(
         if exact_overlap:
             exact_grp = grp[grp["SQL语句"].astype(str).isin(exact_overlap)].copy()
             if not exact_grp.empty:
-                summary_rows.append(build_summary_row(exact_grp, class_id, "跨表完全相同", "是", large_table_map))
+                summary_rows.append(build_summary_row(exact_grp, class_id, "跨表完全相同", "是", large_table_map, enrich_columns))
                 consumed_indexes.update(set(exact_grp.index.tolist()))
 
         remaining_grp = grp.loc[~grp.index.isin(consumed_indexes)].copy()
         if not remaining_grp.empty:
             if exact_overlap:
-                summary_rows.append(build_summary_row(remaining_grp, class_id, "单表内完全相同", "否", large_table_map))
+                summary_rows.append(build_summary_row(remaining_grp, class_id, "单表内完全相同", "否", large_table_map, enrich_columns))
             else:
                 has_exact_match, cross_reason = infer_cross_file_reason(remaining_grp)
-                summary_rows.append(build_summary_row(remaining_grp, class_id, cross_reason, has_exact_match, large_table_map))
+                summary_rows.append(build_summary_row(remaining_grp, class_id, cross_reason, has_exact_match, large_table_map, enrich_columns))
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
         ["重复条数", "涉及文件数"],
@@ -389,6 +412,7 @@ def compare_sql_files(
     deduplicate_within_file: bool = False,
     table_stats_file: str = "",
     large_table_threshold: int = 1000000,
+    enrich_columns: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, int], pd.DataFrame, pd.DataFrame]:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -445,6 +469,7 @@ def compare_sql_files(
         start_row1=start_row1,
         start_row2=start_row2,
         large_table_map=large_table_map,
+        enrich_columns=enrich_columns or [],
     )
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -486,8 +511,11 @@ class SqlDiffApp:
         self.relaxed_match_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="请选择两个 Excel 文件和输出目录。")
         self.status_text: Optional[tk.Text] = None
+        self.history_enrich_columns = load_enrich_columns_config()
+        self.enrich_columns_label_var = tk.StringVar()
 
         self._build_ui()
+        self._refresh_enrich_columns_label()
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self.root, padding=20)
@@ -546,6 +574,14 @@ class SqlDiffApp:
         ttk.Button(button_frame, text="开始比较", command=self.run_compare).pack(side="left")
         ttk.Button(button_frame, text="打开输出目录", command=self.open_output_dir).pack(side="left", padx=(12, 0))
         ttk.Button(button_frame, text="规则说明", command=self.show_rules).pack(side="left", padx=(12, 0))
+        ttk.Button(button_frame, text="汇总字段设置", command=self.open_enrich_columns_dialog).pack(side="left", padx=(12, 0))
+
+        ttk.Label(
+            frame,
+            textvariable=self.enrich_columns_label_var,
+            foreground="#666666",
+            justify="left",
+        ).pack(anchor="w", pady=(0, 10))
 
         status_title = ttk.Label(frame, text="运行状态", font=("Microsoft YaHei UI", 10, "bold"))
         status_title.pack(anchor="w", pady=(8, 6))
@@ -637,6 +673,129 @@ class SqlDiffApp:
         self.status_text.configure(state="disabled")
         self.status_var.set(message)
 
+    def _refresh_enrich_columns_label(self) -> None:
+        preview = "、".join(self.history_enrich_columns[:4])
+        if len(self.history_enrich_columns) > 4:
+            preview += " 等"
+        if not preview:
+            preview = "未配置"
+        self.enrich_columns_label_var.set(
+            f"相似SQL归类汇总附加字段：共 {len(self.history_enrich_columns)} 个，当前为：{preview}"
+        )
+
+    def open_enrich_columns_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("汇总字段设置")
+        dialog.geometry("520x420")
+        dialog.minsize(420, 320)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        container = ttk.Frame(dialog, padding=16)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(
+            container,
+            text="维护“相似SQL归类汇总”需要额外带出的表头名",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            container,
+            text="这些字段如果在上传文件里存在，就会带到汇总表；不存在则自动留空，不会报错。",
+            foreground="#666666",
+            justify="left",
+        ).pack(anchor="w", pady=(6, 12))
+
+        list_frame = ttk.Frame(container)
+        list_frame.pack(fill="both", expand=True)
+
+        listbox = tk.Listbox(list_frame)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        for col in self.history_enrich_columns:
+            listbox.insert("end", col)
+
+        entry_row = ttk.Frame(container)
+        entry_row.pack(fill="x", pady=(12, 8))
+        new_col_var = tk.StringVar()
+        ttk.Entry(entry_row, textvariable=new_col_var).pack(side="left", fill="x", expand=True)
+
+        def add_column() -> None:
+            col = new_col_var.get().strip()
+            if not col:
+                return
+            existing = list(listbox.get(0, "end"))
+            if col in existing:
+                messagebox.showwarning("重复字段", f"字段“{col}”已经存在。", parent=dialog)
+                return
+            listbox.insert("end", col)
+            new_col_var.set("")
+
+        ttk.Button(entry_row, text="新增字段", command=add_column).pack(side="left", padx=(10, 0))
+
+        action_row = ttk.Frame(container)
+        action_row.pack(fill="x", pady=(0, 8))
+
+        def remove_selected() -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            for index in reversed(selection):
+                listbox.delete(index)
+
+        def move_up() -> None:
+            selection = listbox.curselection()
+            if not selection or selection[0] == 0:
+                return
+            for index in selection:
+                text = listbox.get(index)
+                listbox.delete(index)
+                listbox.insert(index - 1, text)
+                listbox.selection_set(index - 1)
+
+        def move_down() -> None:
+            selection = listbox.curselection()
+            if not selection or selection[-1] == listbox.size() - 1:
+                return
+            for index in reversed(selection):
+                text = listbox.get(index)
+                listbox.delete(index)
+                listbox.insert(index + 1, text)
+                listbox.selection_set(index + 1)
+
+        def reset_default() -> None:
+            listbox.delete(0, "end")
+            for col in DEFAULT_HISTORY_ENRICH_COLUMNS:
+                listbox.insert("end", col)
+
+        ttk.Button(action_row, text="删除选中", command=remove_selected).pack(side="left")
+        ttk.Button(action_row, text="上移", command=move_up).pack(side="left", padx=(10, 0))
+        ttk.Button(action_row, text="下移", command=move_down).pack(side="left", padx=(10, 0))
+        ttk.Button(action_row, text="恢复默认", command=reset_default).pack(side="left", padx=(10, 0))
+
+        footer_row = ttk.Frame(container)
+        footer_row.pack(fill="x", pady=(10, 0))
+
+        def save_and_close() -> None:
+            columns = [str(item).strip() for item in listbox.get(0, "end") if str(item).strip()]
+            deduped: List[str] = []
+            seen: Set[str] = set()
+            for col in columns:
+                if col not in seen:
+                    seen.add(col)
+                    deduped.append(col)
+            self.history_enrich_columns = deduped
+            save_enrich_columns_config(self.history_enrich_columns)
+            self._refresh_enrich_columns_label()
+            self._append_status(f"已更新汇总附加字段配置：共 {len(self.history_enrich_columns)} 个。")
+            dialog.destroy()
+
+        ttk.Button(footer_row, text="取消", command=dialog.destroy).pack(side="right")
+        ttk.Button(footer_row, text="保存", command=save_and_close).pack(side="right", padx=(0, 10))
+
     def choose_file1(self) -> None:
         path = self._select_excel_file()
         if path:
@@ -726,6 +885,7 @@ class SqlDiffApp:
                 deduplicate_within_file=relaxed_match,
                 table_stats_file=table_stats_file,
                 large_table_threshold=large_table_threshold,
+                enrich_columns=self.history_enrich_columns,
             )
             self._append_status("比较处理完成，正在整理结果信息...")
         except BadZipFile:
@@ -757,6 +917,7 @@ class SqlDiffApp:
             f"是否上传表数据量统计：{'是' if self.use_table_stats_var.get() else '否'}\n"
             f"表数据量统计文件：{stats_file_desc}\n"
             f"大表阈值：{stats['大表阈值']}\n\n"
+            f"汇总附加字段数：{len(self.history_enrich_columns)}\n\n"
             "生成内容：\n"
             f"1. 原表_{Path(file1).stem}\n"
             f"2. 原表_{Path(file2).stem}\n"
@@ -795,7 +956,8 @@ class SqlDiffApp:
             "3. 支持标准 .xlsx / .xlsm / .xls；对部分伪装成 .xls 的 HTML 表格也会尝试兼容读取。\n"
             "4. “合并判断相同SQL”勾选后，会同时忽略空白差异，并合并同一文件内重复 SQL。\n"
             "5. 不勾选时，严格按原始 SQL 比较，并保留表内重复行。\n\n"
-            "6. 如果上传“表数据量统计”，程序会根据大表阈值判断相似 SQL 是否涉及大表。\n\n"
+            "6. 如果上传“表数据量统计”，程序会根据大表阈值判断相似 SQL 是否涉及大表。\n"
+            "7. 可以通过“汇总字段设置”按钮，自定义相似SQL归类汇总要额外带出的表头名。\n\n"
             "二、相似 SQL 归类规则\n"
             "1. 相似归类不是按业务语义，而是按标准化后的 SQL 骨架分组。\n"
             "2. 归类时会统一大小写和空白格式。\n"
