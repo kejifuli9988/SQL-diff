@@ -5,7 +5,7 @@ import traceback
 import hashlib
 from zipfile import BadZipFile
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import tkinter as tk
@@ -13,6 +13,22 @@ from tkinter import filedialog, messagebox, ttk
 
 
 SQL_COLUMN_NAME = "SQL语句"
+TABLE_STATS_NAME_COLUMN = "表名"
+TABLE_STATS_ROWS_COLUMN = "记录数"
+HISTORY_ENRICH_COLUMNS = [
+    "服务",
+    "大表且暂不优化",
+    "大表表名",
+    "慢SQL分类",
+    "初步优化方案",
+    "应用场景",
+    "加权分数",
+    "优先级",
+    "修复时间",
+    "跟进情况",
+    "备注",
+    "表拆分后的平均执行时间",
+]
 
 
 def normalize_sql(value: object, ignore_whitespace: bool = True) -> str:
@@ -83,6 +99,64 @@ def build_parameter_signature(sql: str) -> str:
     s = re.sub(r"\b\d+\b", "?num?", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def load_large_table_map(file_path: str, threshold: int) -> Dict[str, int]:
+    df = pd.read_excel(file_path)
+    if TABLE_STATS_NAME_COLUMN not in df.columns or TABLE_STATS_ROWS_COLUMN not in df.columns:
+        raise ValueError(f"表数据量统计文件必须包含列：{TABLE_STATS_NAME_COLUMN}、{TABLE_STATS_ROWS_COLUMN}")
+
+    result: Dict[str, int] = {}
+    for _, row in df.iterrows():
+        table_name = str(row.get(TABLE_STATS_NAME_COLUMN, "")).strip()
+        row_count = row.get(TABLE_STATS_ROWS_COLUMN)
+        if not table_name or pd.isna(row_count):
+            continue
+        try:
+            count_int = int(float(row_count))
+        except Exception:
+            continue
+        if count_int >= threshold:
+            result[table_name.upper()] = count_int
+    return result
+
+
+def extract_table_names(sql: str) -> List[str]:
+    normalized = normalize_sql(sql, ignore_whitespace=True)
+    patterns = [
+        r"\bfrom\s+([a-zA-Z0-9_.$]+)",
+        r"\bjoin\s+([a-zA-Z0-9_.$]+)",
+        r"\bupdate\s+([a-zA-Z0-9_.$]+)",
+        r"\binsert\s+into\s+([a-zA-Z0-9_.$]+)",
+        r"\bdelete\s+from\s+([a-zA-Z0-9_.$]+)",
+        r"\bmerge\s+into\s+([a-zA-Z0-9_.$]+)",
+    ]
+    names: List[str] = []
+    seen: Set[str] = set()
+    for pattern in patterns:
+        for match in re.findall(pattern, normalized, flags=re.IGNORECASE):
+            name = str(match).strip().split(".")[-1].upper()
+            if not name or name in {"SELECT", "DUAL"}:
+                continue
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+def merge_group_values(series: pd.Series) -> str:
+    values: List[str] = []
+    seen: Set[str] = set()
+    for value in series:
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if not text or text.lower() == "nan":
+            continue
+        if text not in seen:
+            seen.add(text)
+            values.append(text)
+    return " | ".join(values)
 
 
 def infer_cross_file_reason(grp: pd.DataFrame) -> Tuple[str, str]:
@@ -182,6 +256,7 @@ def build_similarity_reports(
     df2: pd.DataFrame,
     start_row1: int,
     start_row2: int,
+    large_table_map: Optional[Dict[str, int]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     detail_rows: List[Dict[str, object]] = []
     files = [(Path(file1).name, df1, start_row1), (Path(file2).name, df2, start_row2)]
@@ -210,8 +285,11 @@ def build_similarity_reports(
                     "日期归一特征": date_signature,
                     "IN归一特征": inlist_signature,
                     "参数归一特征": parameter_signature,
+                    "SQL涉及表": "、".join(extract_table_names(sql)),
                 }
             )
+            for col in HISTORY_ENRICH_COLUMNS:
+                detail_rows[-1][col] = row.get(col, "") if col in df.columns else ""
 
     detail_df = pd.DataFrame(detail_rows)
     if detail_df.empty:
@@ -235,7 +313,19 @@ def build_similarity_reports(
                 "来源文件": "、".join(grp["来源文件"].drop_duplicates().tolist()),
                 "对应表内第几条": " | ".join(positions),
                 "代表SQL": grp["SQL语句"].iloc[0],
-                "相似SQL特征": grp["相似SQL特征"].iloc[0],
+                "服务": merge_group_values(grp["服务"]) if "服务" in grp.columns else "",
+                "大表且暂不优化": merge_group_values(grp["大表且暂不优化"]) if "大表且暂不优化" in grp.columns else "",
+                "大表表名": merge_group_values(grp["大表表名"]) if "大表表名" in grp.columns else "",
+                "慢SQL分类": merge_group_values(grp["慢SQL分类"]) if "慢SQL分类" in grp.columns else "",
+                "初步优化方案": merge_group_values(grp["初步优化方案"]) if "初步优化方案" in grp.columns else "",
+                "应用场景": merge_group_values(grp["应用场景"]) if "应用场景" in grp.columns else "",
+                "加权分数": merge_group_values(grp["加权分数"]) if "加权分数" in grp.columns else "",
+                "优先级": merge_group_values(grp["优先级"]) if "优先级" in grp.columns else "",
+                "修复时间": merge_group_values(grp["修复时间"]) if "修复时间" in grp.columns else "",
+                "跟进情况": merge_group_values(grp["跟进情况"]) if "跟进情况" in grp.columns else "",
+                "备注": merge_group_values(grp["备注"]) if "备注" in grp.columns else "",
+                "规则判断是否有大表": "",
+                "规则判断涉及到的大表名称": "",
             }
         )
 
@@ -243,6 +333,18 @@ def build_similarity_reports(
         ["重复条数", "涉及文件数"],
         ascending=[False, False],
     )
+
+    if large_table_map:
+        large_flags = []
+        large_names = []
+        for _, row in summary_df.iterrows():
+            tables = extract_table_names(row["代表SQL"])
+            matched = [name for name in tables if name in large_table_map]
+            large_flags.append("是" if matched else "否")
+            large_names.append("、".join(matched))
+        summary_df["规则判断是否有大表"] = large_flags
+        summary_df["规则判断涉及到的大表名称"] = large_names
+
     return summary_df, detail_df
 
 
@@ -251,6 +353,8 @@ def compare_sql_files(
     file2: str,
     output_dir: str,
     ignore_whitespace: bool = True,
+    table_stats_file: str = "",
+    large_table_threshold: int = 1000000,
 ) -> Tuple[str, Dict[str, int], pd.DataFrame, pd.DataFrame]:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -287,6 +391,10 @@ def compare_sql_files(
     sheet_only2 = f"仅{name2}"[:31]
     sheet_both1 = f"共有({name1})"[:31]
     sheet_both2 = f"共有({name2})"[:31]
+    large_table_map: Optional[Dict[str, int]] = None
+    if table_stats_file.strip():
+        large_table_map = load_large_table_map(table_stats_file.strip(), large_table_threshold)
+
     similarity_summary_df, similarity_detail_df = build_similarity_reports(
         file1=file1,
         file2=file2,
@@ -294,6 +402,7 @@ def compare_sql_files(
         df2=df2,
         start_row1=start_row1,
         start_row2=start_row2,
+        large_table_map=large_table_map,
     )
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -313,6 +422,7 @@ def compare_sql_files(
         "仅表2": len(only2_df),
         "共有": len(both1_keys),
         "相似类数": len(similarity_summary_df),
+        "大表阈值": large_table_threshold,
     }
     return output_path, stats, similarity_summary_df, similarity_detail_df
 
@@ -326,7 +436,9 @@ class SqlDiffApp:
 
         self.file1_var = tk.StringVar()
         self.file2_var = tk.StringVar()
+        self.table_stats_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(Path.home() / "Desktop"))
+        self.large_table_threshold_var = tk.StringVar(value="1000000")
         self.ignore_whitespace_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="请选择两个 Excel 文件和输出目录。")
 
@@ -348,6 +460,7 @@ class SqlDiffApp:
 
         self._build_file_row(frame, "表1 Excel", self.file1_var, self.choose_file1)
         self._build_file_row(frame, "表2 Excel", self.file2_var, self.choose_file2)
+        self._build_file_row(frame, "表数据量统计", self.table_stats_var, self.choose_table_stats_file)
         self._build_file_row(frame, "输出目录", self.output_dir_var, self.choose_output_dir, select_file=False)
 
         option_frame = ttk.Frame(frame)
@@ -365,6 +478,16 @@ class SqlDiffApp:
             foreground="#666666",
         )
         tip.pack(anchor="w", pady=(6, 0))
+
+        threshold_row = ttk.Frame(option_frame)
+        threshold_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(threshold_row, text="大表阈值(记录数)", width=16).pack(side="left")
+        ttk.Entry(threshold_row, textvariable=self.large_table_threshold_var, width=18).pack(side="left")
+        ttk.Label(
+            threshold_row,
+            text="默认 1000000；仅在上传“表数据量统计”时生效",
+            foreground="#666666",
+        ).pack(side="left", padx=(10, 0))
 
         button_frame = ttk.Frame(frame)
         button_frame.pack(fill="x", pady=(24, 12))
@@ -417,15 +540,21 @@ class SqlDiffApp:
         if path:
             self.output_dir_var.set(path)
 
-    def _select_excel_file(self) -> str:
+    def choose_table_stats_file(self) -> None:
+        path = self._select_excel_file(title="选择表数据量统计文件")
+        if path:
+            self.table_stats_var.set(path)
+
+    def _select_excel_file(self, title: str = "选择 Excel 文件") -> str:
         return filedialog.askopenfilename(
-            title="选择 Excel 文件",
+            title=title,
             filetypes=[("Excel 文件", "*.xlsx *.xls"), ("所有文件", "*.*")],
         )
 
     def run_compare(self) -> None:
         file1 = self.file1_var.get().strip()
         file2 = self.file2_var.get().strip()
+        table_stats_file = self.table_stats_var.get().strip()
         output_dir = self.output_dir_var.get().strip()
 
         if not file1 or not file2:
@@ -434,6 +563,16 @@ class SqlDiffApp:
 
         if not output_dir:
             messagebox.showwarning("缺少输出目录", "请选择输出目录。")
+            return
+
+        try:
+            large_table_threshold = int(self.large_table_threshold_var.get().strip())
+        except Exception:
+            messagebox.showwarning("阈值无效", "大表阈值请输入整数。")
+            return
+
+        if large_table_threshold < 0:
+            messagebox.showwarning("阈值无效", "大表阈值不能小于 0。")
             return
 
         self.status_var.set("正在比较，请稍候...")
@@ -456,6 +595,8 @@ class SqlDiffApp:
                 file2=file2,
                 output_dir=output_dir,
                 ignore_whitespace=self.ignore_whitespace_var.get(),
+                table_stats_file=table_stats_file,
+                large_table_threshold=large_table_threshold,
             )
         except BadZipFile:
             msg = (
@@ -479,7 +620,8 @@ class SqlDiffApp:
             f"仅表1：{stats['仅表1']}\n"
             f"仅表2：{stats['仅表2']}\n"
             f"共有：{stats['共有']}\n"
-            f"相似SQL类数：{stats['相似类数']}\n\n"
+            f"相似SQL类数：{stats['相似类数']}\n"
+            f"大表阈值：{stats['大表阈值']}\n\n"
             "生成内容：\n"
             f"1. 原表_{Path(file1).stem}\n"
             f"2. 原表_{Path(file2).stem}\n"
@@ -518,6 +660,7 @@ class SqlDiffApp:
             "3. 支持标准 .xlsx / .xlsm / .xls；对部分伪装成 .xls 的 HTML 表格也会尝试兼容读取。\n"
             "4. 同一个文件中，如果同一条 SQL 重复出现，只保留首次出现的那一行参与主比较。\n"
             "5. “忽略空白差异”勾选后，会忽略换行、多个空格和首尾空格；不勾选时按原始 SQL 比较。\n\n"
+            "6. 如果上传“表数据量统计”，程序会根据大表阈值判断相似 SQL 是否涉及大表。\n\n"
             "二、相似 SQL 归类规则\n"
             "1. 相似归类不是按业务语义，而是按标准化后的 SQL 骨架分组。\n"
             "2. 归类时会统一大小写和空白格式。\n"
@@ -529,7 +672,8 @@ class SqlDiffApp:
             "三、汇总表字段说明\n"
             "1. 是否存在完全相同SQL：表示两个表里是否出现过完全一致的原始 SQL。\n"
             "2. 跨表原因：可能是“完全相同 / 仅日期不同 / IN列表不同 / 仅参数不同 / 结构相似 / 仅单表出现”。\n"
-            "3. 对应表内第几条：显示这一类 SQL 分别出现在各原表里的第几条，方便回原表定位。"
+            "3. 对应表内第几条：显示这一类 SQL 分别出现在各原表里的第几条，方便回原表定位。\n"
+            "4. 规则判断是否有大表 / 规则判断涉及到的大表名称：基于“表数据量统计”文件中的表名和记录数判断。"
         )
         messagebox.showinfo("规则说明", message)
 
