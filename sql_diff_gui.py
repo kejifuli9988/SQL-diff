@@ -169,8 +169,13 @@ def infer_cross_file_reason(grp: pd.DataFrame) -> Tuple[str, str]:
 
     exact_a = set(file_a["SQL语句"])
     exact_b = set(file_b["SQL语句"])
-    if exact_a & exact_b:
-        return "是", "完全相同"
+    exact_overlap = exact_a & exact_b
+    if exact_overlap:
+        only_a = exact_a - exact_b
+        only_b = exact_b - exact_a
+        if not only_a and not only_b:
+            return "是", "跨表完全相同"
+        return "是", "跨表部分完全相同"
 
     date_a = set(file_a["日期归一特征"])
     date_b = set(file_b["日期归一特征"])
@@ -188,6 +193,53 @@ def infer_cross_file_reason(grp: pd.DataFrame) -> Tuple[str, str]:
         return "否", "仅参数不同"
 
     return "否", "结构相似"
+
+
+def build_summary_row(
+    grp: pd.DataFrame,
+    class_id: str,
+    cross_reason: str,
+    has_exact_match: str,
+    large_table_map: Optional[Dict[str, int]] = None,
+) -> Dict[str, object]:
+    positions = []
+    for file_name, sub in grp.groupby("来源文件", sort=False):
+        seqs = "、".join(str(x) for x in sub["对应表内第几条"].tolist())
+        positions.append(f"{file_name}: {seqs}")
+
+    matched_tables: List[str] = []
+    if large_table_map:
+        seen: Set[str] = set()
+        for sql in grp["SQL语句"].astype(str):
+            for table_name in extract_table_names(sql):
+                if table_name in large_table_map and table_name not in seen:
+                    seen.add(table_name)
+                    matched_tables.append(table_name)
+
+    return {
+        "相似类ID": class_id,
+        "SQL类型": grp["SQL类型"].iloc[0],
+        "重复条数": len(grp),
+        "涉及文件数": grp["来源文件"].nunique(),
+        "是否存在完全相同SQL": has_exact_match,
+        "跨表原因": cross_reason,
+        "来源文件": "、".join(grp["来源文件"].drop_duplicates().tolist()),
+        "对应表内第几条": " | ".join(positions),
+        "代表SQL": grp["SQL语句"].iloc[0],
+        "服务": merge_group_values(grp["服务"]) if "服务" in grp.columns else "",
+        "大表且暂不优化": merge_group_values(grp["大表且暂不优化"]) if "大表且暂不优化" in grp.columns else "",
+        "大表表名": merge_group_values(grp["大表表名"]) if "大表表名" in grp.columns else "",
+        "慢SQL分类": merge_group_values(grp["慢SQL分类"]) if "慢SQL分类" in grp.columns else "",
+        "初步优化方案": merge_group_values(grp["初步优化方案"]) if "初步优化方案" in grp.columns else "",
+        "应用场景": merge_group_values(grp["应用场景"]) if "应用场景" in grp.columns else "",
+        "加权分数": merge_group_values(grp["加权分数"]) if "加权分数" in grp.columns else "",
+        "优先级": merge_group_values(grp["优先级"]) if "优先级" in grp.columns else "",
+        "修复时间": merge_group_values(grp["修复时间"]) if "修复时间" in grp.columns else "",
+        "跟进情况": merge_group_values(grp["跟进情况"]) if "跟进情况" in grp.columns else "",
+        "备注": merge_group_values(grp["备注"]) if "备注" in grp.columns else "",
+        "规则判断是否有大表": "是" if matched_tables else "否",
+        "规则判断涉及到的大表名称": "、".join(matched_tables),
+    }
 
 
 def clean_col_name(value: object) -> str:
@@ -297,53 +349,34 @@ def build_similarity_reports(
 
     summary_rows = []
     for class_id, grp in detail_df.groupby("相似类ID", sort=False):
-        has_exact_match, cross_reason = infer_cross_file_reason(grp)
-        positions = []
-        for file_name, sub in grp.groupby("来源文件", sort=False):
-            seqs = "、".join(str(x) for x in sub["对应表内第几条"].tolist())
-            positions.append(f"{file_name}: {seqs}")
-        summary_rows.append(
-            {
-                "相似类ID": class_id,
-                "SQL类型": grp["SQL类型"].iloc[0],
-                "重复条数": len(grp),
-                "涉及文件数": grp["来源文件"].nunique(),
-                "是否存在完全相同SQL": has_exact_match,
-                "跨表原因": cross_reason,
-                "来源文件": "、".join(grp["来源文件"].drop_duplicates().tolist()),
-                "对应表内第几条": " | ".join(positions),
-                "代表SQL": grp["SQL语句"].iloc[0],
-                "服务": merge_group_values(grp["服务"]) if "服务" in grp.columns else "",
-                "大表且暂不优化": merge_group_values(grp["大表且暂不优化"]) if "大表且暂不优化" in grp.columns else "",
-                "大表表名": merge_group_values(grp["大表表名"]) if "大表表名" in grp.columns else "",
-                "慢SQL分类": merge_group_values(grp["慢SQL分类"]) if "慢SQL分类" in grp.columns else "",
-                "初步优化方案": merge_group_values(grp["初步优化方案"]) if "初步优化方案" in grp.columns else "",
-                "应用场景": merge_group_values(grp["应用场景"]) if "应用场景" in grp.columns else "",
-                "加权分数": merge_group_values(grp["加权分数"]) if "加权分数" in grp.columns else "",
-                "优先级": merge_group_values(grp["优先级"]) if "优先级" in grp.columns else "",
-                "修复时间": merge_group_values(grp["修复时间"]) if "修复时间" in grp.columns else "",
-                "跟进情况": merge_group_values(grp["跟进情况"]) if "跟进情况" in grp.columns else "",
-                "备注": merge_group_values(grp["备注"]) if "备注" in grp.columns else "",
-                "规则判断是否有大表": "",
-                "规则判断涉及到的大表名称": "",
-            }
-        )
+        if grp["来源文件"].nunique() < 2:
+            summary_rows.append(build_summary_row(grp, class_id, "仅单表出现", "否", large_table_map))
+            continue
+
+        file_names = list(grp["来源文件"].drop_duplicates())
+        file_a = grp[grp["来源文件"] == file_names[0]]
+        file_b = grp[grp["来源文件"] == file_names[1]]
+        exact_overlap = set(file_a["SQL语句"].astype(str)) & set(file_b["SQL语句"].astype(str))
+
+        consumed_indexes: Set[int] = set()
+        if exact_overlap:
+            exact_grp = grp[grp["SQL语句"].astype(str).isin(exact_overlap)].copy()
+            if not exact_grp.empty:
+                summary_rows.append(build_summary_row(exact_grp, class_id, "跨表完全相同", "是", large_table_map))
+                consumed_indexes.update(set(exact_grp.index.tolist()))
+
+        remaining_grp = grp.loc[~grp.index.isin(consumed_indexes)].copy()
+        if not remaining_grp.empty:
+            if exact_overlap:
+                summary_rows.append(build_summary_row(remaining_grp, class_id, "单表内完全相同", "否", large_table_map))
+            else:
+                has_exact_match, cross_reason = infer_cross_file_reason(remaining_grp)
+                summary_rows.append(build_summary_row(remaining_grp, class_id, cross_reason, has_exact_match, large_table_map))
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
         ["重复条数", "涉及文件数"],
         ascending=[False, False],
     )
-
-    if large_table_map:
-        large_flags = []
-        large_names = []
-        for _, row in summary_df.iterrows():
-            tables = extract_table_names(row["代表SQL"])
-            matched = [name for name in tables if name in large_table_map]
-            large_flags.append("是" if matched else "否")
-            large_names.append("、".join(matched))
-        summary_df["规则判断是否有大表"] = large_flags
-        summary_df["规则判断涉及到的大表名称"] = large_names
 
     return summary_df, detail_df
 
@@ -353,6 +386,7 @@ def compare_sql_files(
     file2: str,
     output_dir: str,
     ignore_whitespace: bool = True,
+    deduplicate_within_file: bool = False,
     table_stats_file: str = "",
     large_table_threshold: int = 1000000,
 ) -> Tuple[str, Dict[str, int], pd.DataFrame, pd.DataFrame]:
@@ -367,21 +401,29 @@ def compare_sql_files(
     df1 = df1[df1[SQL_COLUMN_NAME].notna()].copy()
     df2 = df2[df2[SQL_COLUMN_NAME].notna()].copy()
 
-    map1, order1 = build_sql_map(df1, ignore_whitespace)
-    map2, order2 = build_sql_map(df2, ignore_whitespace)
+    df1["_compare_sql_key"] = df1[SQL_COLUMN_NAME].apply(lambda x: normalize_sql(x, ignore_whitespace))
+    df2["_compare_sql_key"] = df2[SQL_COLUMN_NAME].apply(lambda x: normalize_sql(x, ignore_whitespace))
 
-    set1 = set(map1.keys())
-    set2 = set(map2.keys())
+    if deduplicate_within_file:
+        df1 = df1.drop_duplicates(subset=["_compare_sql_key"], keep="first").copy()
+        df2 = df2.drop_duplicates(subset=["_compare_sql_key"], keep="first").copy()
+    else:
+        # Keep the helper column for non-deduplicated filtering, then drop it from exported sheets later.
+        pass
 
-    only1_keys = [key for key in order1 if key in (set1 - set2)]
-    only2_keys = [key for key in order2 if key in (set2 - set1)]
-    both1_keys = [key for key in order1 if key in (set1 & set2)]
-    both2_keys = [key for key in order2 if key in (set1 & set2)]
+    keys1 = set(df1["_compare_sql_key"])
+    keys2 = set(df2["_compare_sql_key"])
+    only1_keys = keys1 - keys2
+    only2_keys = keys2 - keys1
+    both_keys = keys1 & keys2
 
-    only1_df = build_dataframe_from_rows((map1[key] for key in only1_keys), df1.columns)
-    only2_df = build_dataframe_from_rows((map2[key] for key in only2_keys), df2.columns)
-    both1_df = build_dataframe_from_rows((map1[key] for key in both1_keys), df1.columns)
-    both2_df = build_dataframe_from_rows((map2[key] for key in both2_keys), df2.columns)
+    only1_df = df1[df1["_compare_sql_key"].isin(only1_keys)].drop(columns=["_compare_sql_key"])
+    only2_df = df2[df2["_compare_sql_key"].isin(only2_keys)].drop(columns=["_compare_sql_key"])
+    both1_df = df1[df1["_compare_sql_key"].isin(both_keys)].drop(columns=["_compare_sql_key"])
+    both2_df = df2[df2["_compare_sql_key"].isin(both_keys)].drop(columns=["_compare_sql_key"])
+
+    df1 = df1.drop(columns=["_compare_sql_key"])
+    df2 = df2.drop(columns=["_compare_sql_key"])
 
     name1 = Path(file1).stem
     name2 = Path(file2).stem
@@ -416,13 +458,14 @@ def compare_sql_files(
         similarity_detail_df.to_excel(writer, sheet_name="相似SQL明细", index=False)
 
     stats = {
-        "表1总数": len(map1),
-        "表2总数": len(map2),
+        "表1总数": len(df1),
+        "表2总数": len(df2),
         "仅表1": len(only1_df),
         "仅表2": len(only2_df),
-        "共有": len(both1_keys),
+        "共有": len(both1_df),
         "相似类数": len(similarity_summary_df),
         "大表阈值": large_table_threshold,
+        "表内去重": "是" if deduplicate_within_file else "否",
     }
     return output_path, stats, similarity_summary_df, similarity_detail_df
 
@@ -431,15 +474,15 @@ class SqlDiffApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("SQL 语句 Excel 比较工具")
-        self.root.geometry("720x420")
-        self.root.minsize(680, 400)
+        self.root.geometry("680x630")
+        self.root.minsize(600, 400)
 
         self.file1_var = tk.StringVar()
         self.file2_var = tk.StringVar()
         self.table_stats_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(Path.home() / "Desktop"))
         self.large_table_threshold_var = tk.StringVar(value="1000000")
-        self.ignore_whitespace_var = tk.BooleanVar(value=False)
+        self.relaxed_match_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="请选择两个 Excel 文件和输出目录。")
 
         self._build_ui()
@@ -466,15 +509,21 @@ class SqlDiffApp:
         option_frame = ttk.Frame(frame)
         option_frame.pack(fill="x", pady=(18, 10))
 
+        ttk.Label(
+            option_frame,
+            text="相同判断规则",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(anchor="w")
+
         ttk.Checkbutton(
             option_frame,
-            text="忽略空白差异（换行、多个空格、首尾空格）",
-            variable=self.ignore_whitespace_var,
+            text="合并判断相同SQL（忽略空白差异，并合并同一文件内重复SQL）",
+            variable=self.relaxed_match_var,
         ).pack(anchor="w")
 
         tip = ttk.Label(
             option_frame,
-            text="提示：如果同一个文件中同一条 SQL 重复出现，程序会保留首次出现的那一行。",
+            text="提示：不勾选时严格按原始 SQL 比较；勾选后会按更适合合并的规则判断相同 SQL。",
             foreground="#666666",
         )
         tip.pack(anchor="w", pady=(6, 0))
@@ -579,6 +628,7 @@ class SqlDiffApp:
         self.root.update_idletasks()
 
         try:
+            relaxed_match = self.relaxed_match_var.get()
             output_name = f"SQL比较结果_{Path(file1).stem}_VS_{Path(file2).stem}.xlsx"
             output_path = os.path.join(output_dir, output_name)
             if os.path.exists(output_path):
@@ -594,7 +644,8 @@ class SqlDiffApp:
                 file1=file1,
                 file2=file2,
                 output_dir=output_dir,
-                ignore_whitespace=self.ignore_whitespace_var.get(),
+                ignore_whitespace=relaxed_match,
+                deduplicate_within_file=relaxed_match,
                 table_stats_file=table_stats_file,
                 large_table_threshold=large_table_threshold,
             )
@@ -621,6 +672,8 @@ class SqlDiffApp:
             f"仅表2：{stats['仅表2']}\n"
             f"共有：{stats['共有']}\n"
             f"相似SQL类数：{stats['相似类数']}\n"
+            f"合并判断相同SQL：{'是' if relaxed_match else '否'}\n"
+            f"表内去重：{stats['表内去重']}\n"
             f"大表阈值：{stats['大表阈值']}\n\n"
             "生成内容：\n"
             f"1. 原表_{Path(file1).stem}\n"
@@ -658,8 +711,8 @@ class SqlDiffApp:
             "1. 以“SQL语句”列作为比较依据。\n"
             "2. 程序会自动在前 30 行里寻找真正表头，不要求第一行就是表头。\n"
             "3. 支持标准 .xlsx / .xlsm / .xls；对部分伪装成 .xls 的 HTML 表格也会尝试兼容读取。\n"
-            "4. 同一个文件中，如果同一条 SQL 重复出现，只保留首次出现的那一行参与主比较。\n"
-            "5. “忽略空白差异”勾选后，会忽略换行、多个空格和首尾空格；不勾选时按原始 SQL 比较。\n\n"
+            "4. “合并判断相同SQL”勾选后，会同时忽略空白差异，并合并同一文件内重复 SQL。\n"
+            "5. 不勾选时，严格按原始 SQL 比较，并保留表内重复行。\n\n"
             "6. 如果上传“表数据量统计”，程序会根据大表阈值判断相似 SQL 是否涉及大表。\n\n"
             "二、相似 SQL 归类规则\n"
             "1. 相似归类不是按业务语义，而是按标准化后的 SQL 骨架分组。\n"
@@ -671,7 +724,7 @@ class SqlDiffApp:
             "7. 两条 SQL 标准化后完全一致，才会归到同一个“相似类ID”。\n\n"
             "三、汇总表字段说明\n"
             "1. 是否存在完全相同SQL：表示两个表里是否出现过完全一致的原始 SQL。\n"
-            "2. 跨表原因：可能是“完全相同 / 仅日期不同 / IN列表不同 / 仅参数不同 / 结构相似 / 仅单表出现”。\n"
+            "2. 跨表原因：可能是“跨表完全相同 / 单表内完全相同 / 仅日期不同 / IN列表不同 / 仅参数不同 / 结构相似 / 仅单表出现”。\n"
             "3. 对应表内第几条：显示这一类 SQL 分别出现在各原表里的第几条，方便回原表定位。\n"
             "4. 规则判断是否有大表 / 规则判断涉及到的大表名称：基于“表数据量统计”文件中的表名和记录数判断。"
         )
