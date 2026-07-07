@@ -350,8 +350,8 @@ def build_similarity_reports(
             detail_rows.append(
                 {
                     "来源文件": file_name,
-                    "对应表内第几条": idx + 1,
-                    "原始Excel行号": start_row + idx,
+                    "对应表内第几条": int(row.get("_source_seq", idx + 1)),
+                    "原始Excel行号": int(row.get("_excel_row_no", start_row + idx)),
                     "相似类ID": strict_class_id,
                     "SQL类型": classify_sql(sql),
                     "原表指纹": raw_fingerprint,
@@ -424,8 +424,14 @@ def compare_sql_files(
 
     df1 = df1[df1[SQL_COLUMN_NAME].notna()].copy()
     df2 = df2[df2[SQL_COLUMN_NAME].notna()].copy()
+    df1["_source_seq"] = range(1, len(df1) + 1)
+    df2["_source_seq"] = range(1, len(df2) + 1)
+    df1["_excel_row_no"] = range(start_row1, start_row1 + len(df1))
+    df2["_excel_row_no"] = range(start_row2, start_row2 + len(df2))
     raw_df1 = df1.copy()
     raw_df2 = df2.copy()
+    detail_df1 = df1.copy()
+    detail_df2 = df2.copy()
 
     df1["_compare_sql_key"] = df1[SQL_COLUMN_NAME].apply(lambda x: normalize_sql(x, ignore_whitespace))
     df2["_compare_sql_key"] = df2[SQL_COLUMN_NAME].apply(lambda x: normalize_sql(x, ignore_whitespace))
@@ -443,10 +449,11 @@ def compare_sql_files(
     only2_keys = keys2 - keys1
     both_keys = keys1 & keys2
 
-    only1_df = df1[df1["_compare_sql_key"].isin(only1_keys)].drop(columns=["_compare_sql_key"])
-    only2_df = df2[df2["_compare_sql_key"].isin(only2_keys)].drop(columns=["_compare_sql_key"])
-    both1_df = df1[df1["_compare_sql_key"].isin(both_keys)].drop(columns=["_compare_sql_key"])
-    both2_df = df2[df2["_compare_sql_key"].isin(both_keys)].drop(columns=["_compare_sql_key"])
+    helper_columns = ["_compare_sql_key", "_source_seq", "_excel_row_no"]
+    only1_df = df1[df1["_compare_sql_key"].isin(only1_keys)].drop(columns=helper_columns)
+    only2_df = df2[df2["_compare_sql_key"].isin(only2_keys)].drop(columns=helper_columns)
+    both1_df = df1[df1["_compare_sql_key"].isin(both_keys)].drop(columns=helper_columns)
+    both2_df = df2[df2["_compare_sql_key"].isin(both_keys)].drop(columns=helper_columns)
 
     df1 = df1.drop(columns=["_compare_sql_key"])
     df2 = df2.drop(columns=["_compare_sql_key"])
@@ -466,8 +473,8 @@ def compare_sql_files(
     similarity_summary_df, similarity_detail_df = build_similarity_reports(
         file1=file1,
         file2=file2,
-        df1=df1,
-        df2=df2,
+        df1=detail_df1,
+        df2=detail_df2,
         start_row1=start_row1,
         start_row2=start_row2,
         large_table_map=large_table_map,
@@ -475,8 +482,8 @@ def compare_sql_files(
     )
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        raw_df1.to_excel(writer, sheet_name=f"原表_{name1}"[:31], index=False)
-        raw_df2.to_excel(writer, sheet_name=f"原表_{name2}"[:31], index=False)
+        raw_df1.drop(columns=["_source_seq", "_excel_row_no"]).to_excel(writer, sheet_name=f"原表_{name1}"[:31], index=False)
+        raw_df2.drop(columns=["_source_seq", "_excel_row_no"]).to_excel(writer, sheet_name=f"原表_{name2}"[:31], index=False)
         only1_df.to_excel(writer, sheet_name=sheet_only1, index=False)
         only2_df.to_excel(writer, sheet_name=sheet_only2, index=False)
         both1_df.to_excel(writer, sheet_name=sheet_both1, index=False)
