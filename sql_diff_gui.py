@@ -424,6 +424,8 @@ def compare_sql_files(
 
     df1 = df1[df1[SQL_COLUMN_NAME].notna()].copy()
     df2 = df2[df2[SQL_COLUMN_NAME].notna()].copy()
+    raw_df1 = df1.copy()
+    raw_df2 = df2.copy()
 
     df1["_compare_sql_key"] = df1[SQL_COLUMN_NAME].apply(lambda x: normalize_sql(x, ignore_whitespace))
     df2["_compare_sql_key"] = df2[SQL_COLUMN_NAME].apply(lambda x: normalize_sql(x, ignore_whitespace))
@@ -473,8 +475,8 @@ def compare_sql_files(
     )
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df1.to_excel(writer, sheet_name=f"原表_{name1}"[:31], index=False)
-        df2.to_excel(writer, sheet_name=f"原表_{name2}"[:31], index=False)
+        raw_df1.to_excel(writer, sheet_name=f"原表_{name1}"[:31], index=False)
+        raw_df2.to_excel(writer, sheet_name=f"原表_{name2}"[:31], index=False)
         only1_df.to_excel(writer, sheet_name=sheet_only1, index=False)
         only2_df.to_excel(writer, sheet_name=sheet_only2, index=False)
         both1_df.to_excel(writer, sheet_name=sheet_both1, index=False)
