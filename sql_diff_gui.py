@@ -480,10 +480,12 @@ class SqlDiffApp:
         self.file1_var = tk.StringVar()
         self.file2_var = tk.StringVar()
         self.table_stats_var = tk.StringVar()
+        self.use_table_stats_var = tk.BooleanVar(value=False)
         self.output_dir_var = tk.StringVar(value=str(Path.home() / "Desktop"))
         self.large_table_threshold_var = tk.StringVar(value="1000000")
         self.relaxed_match_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="请选择两个 Excel 文件和输出目录。")
+        self.status_text: Optional[tk.Text] = None
 
         self._build_ui()
 
@@ -503,7 +505,7 @@ class SqlDiffApp:
 
         self._build_file_row(frame, "表1 Excel", self.file1_var, self.choose_file1)
         self._build_file_row(frame, "表2 Excel", self.file2_var, self.choose_file2)
-        self._build_file_row(frame, "表数据量统计", self.table_stats_var, self.choose_table_stats_file)
+        self._build_table_stats_row(frame)
         self._build_file_row(frame, "输出目录", self.output_dir_var, self.choose_output_dir, select_file=False)
 
         option_frame = ttk.Frame(frame)
@@ -548,15 +550,23 @@ class SqlDiffApp:
         status_title = ttk.Label(frame, text="运行状态", font=("Microsoft YaHei UI", 10, "bold"))
         status_title.pack(anchor="w", pady=(8, 6))
 
-        status_label = ttk.Label(
-            frame,
-            textvariable=self.status_var,
+        status_frame = ttk.Frame(frame)
+        status_frame.pack(fill="both", expand=True)
+
+        self.status_text = tk.Text(
+            status_frame,
+            wrap="word",
+            height=12,
             relief="solid",
-            padding=12,
-            anchor="w",
-            justify="left",
+            bd=1,
+            padx=10,
+            pady=10,
         )
-        status_label.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(status_frame, orient="vertical", command=self.status_text.yview)
+        self.status_text.configure(yscrollcommand=scrollbar.set)
+        self.status_text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self._set_status("请选择两个 Excel 文件和输出目录。")
 
     def _build_file_row(
         self,
@@ -574,6 +584,59 @@ class SqlDiffApp:
         button_text = "选择文件" if select_file else "选择目录"
         ttk.Button(row, text=button_text, command=command).pack(side="left")
 
+    def _build_table_stats_row(self, parent: ttk.Frame) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=8)
+
+        ttk.Label(row, text="表数据量统计", width=12).pack(side="left")
+        ttk.Checkbutton(
+            row,
+            text="是否上传",
+            variable=self.use_table_stats_var,
+            command=self._toggle_table_stats_state,
+        ).pack(side="left", padx=(0, 10))
+        self.table_stats_entry = ttk.Entry(row, textvariable=self.table_stats_var, state="disabled")
+        self.table_stats_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.table_stats_button = ttk.Button(
+            row,
+            text="选择文件",
+            command=self.choose_table_stats_file,
+            state="disabled",
+        )
+        self.table_stats_button.pack(side="left")
+
+    def _toggle_table_stats_state(self) -> None:
+        enabled = self.use_table_stats_var.get()
+        state = "normal" if enabled else "disabled"
+        self.table_stats_entry.configure(state=state)
+        self.table_stats_button.configure(state=state)
+        if not enabled:
+            self.table_stats_var.set("")
+
+    def _set_status(self, message: str) -> None:
+        self.status_var.set(message)
+        if self.status_text is None:
+            return
+        self.status_text.configure(state="normal")
+        self.status_text.delete("1.0", "end")
+        self.status_text.insert("1.0", message)
+        self.status_text.see("end")
+        self.status_text.configure(state="disabled")
+
+    def _append_status(self, message: str) -> None:
+        if self.status_text is None:
+            self.status_var.set(message)
+            return
+        self.status_text.configure(state="normal")
+        current = self.status_text.get("1.0", "end-1c").strip()
+        if current:
+            self.status_text.insert("end", f"\n\n{message}")
+        else:
+            self.status_text.insert("1.0", message)
+        self.status_text.see("end")
+        self.status_text.configure(state="disabled")
+        self.status_var.set(message)
+
     def choose_file1(self) -> None:
         path = self._select_excel_file()
         if path:
@@ -590,6 +653,9 @@ class SqlDiffApp:
             self.output_dir_var.set(path)
 
     def choose_table_stats_file(self) -> None:
+        if not self.use_table_stats_var.get():
+            self.use_table_stats_var.set(True)
+            self._toggle_table_stats_state()
         path = self._select_excel_file(title="选择表数据量统计文件")
         if path:
             self.table_stats_var.set(path)
@@ -603,7 +669,7 @@ class SqlDiffApp:
     def run_compare(self) -> None:
         file1 = self.file1_var.get().strip()
         file2 = self.file2_var.get().strip()
-        table_stats_file = self.table_stats_var.get().strip()
+        table_stats_file = self.table_stats_var.get().strip() if self.use_table_stats_var.get() else ""
         output_dir = self.output_dir_var.get().strip()
 
         if not file1 or not file2:
@@ -624,7 +690,18 @@ class SqlDiffApp:
             messagebox.showwarning("阈值无效", "大表阈值不能小于 0。")
             return
 
-        self.status_var.set("正在比较，请稍候...")
+        if self.use_table_stats_var.get() and not table_stats_file:
+            messagebox.showwarning("缺少文件", "你已选择上传表数据量统计，请再选择对应文件。")
+            return
+
+        self._set_status("正在比较，请稍候...")
+        self._append_status(f"表1文件：{file1}")
+        self._append_status(f"表2文件：{file2}")
+        self._append_status(f"是否上传表数据量统计：{'是' if self.use_table_stats_var.get() else '否'}")
+        if table_stats_file:
+            self._append_status(f"表数据量统计文件：{table_stats_file}")
+            self._append_status(f"大表阈值：{large_table_threshold}")
+        self._append_status(f"合并判断相同SQL：{'是' if self.relaxed_match_var.get() else '否'}")
         self.root.update_idletasks()
 
         try:
@@ -632,12 +709,13 @@ class SqlDiffApp:
             output_name = f"SQL比较结果_{Path(file1).stem}_VS_{Path(file2).stem}.xlsx"
             output_path = os.path.join(output_dir, output_name)
             if os.path.exists(output_path):
+                self._append_status(f"检测到同名结果文件：{output_path}")
                 should_overwrite = messagebox.askyesno(
                     "文件已存在",
                     f"结果文件已存在：\n{output_path}\n\n是否覆盖？",
                 )
                 if not should_overwrite:
-                    self.status_var.set("已取消生成：存在同名结果文件，且未选择覆盖。")
+                    self._set_status("已取消生成：存在同名结果文件，且未选择覆盖。")
                     return
 
             output_path, stats, _, _ = compare_sql_files(
@@ -649,21 +727,23 @@ class SqlDiffApp:
                 table_stats_file=table_stats_file,
                 large_table_threshold=large_table_threshold,
             )
+            self._append_status("比较处理完成，正在整理结果信息...")
         except BadZipFile:
             msg = (
                 "文件扩展名看起来像 Excel，但文件内容不是标准的 .xlsx/.xlsm 格式。\n"
                 "请确认不是把 CSV、截图导出文件或临时文件误当成 Excel 选进来了。"
             )
-            self.status_var.set(f"比较失败：{msg}")
+            self._set_status(f"比较失败：{msg}")
             messagebox.showerror("比较失败", msg)
             return
         except Exception as exc:
-            self.status_var.set(f"比较失败：{exc}")
+            self._set_status(f"比较失败：{exc}")
             traceback.print_exc()
             messagebox.showerror("比较失败", f"{exc}")
             return
 
-        self.status_var.set(
+        stats_file_desc = table_stats_file if table_stats_file else "未上传"
+        self._set_status(
             "比较完成。\n"
             f"结果文件：{output_path}\n\n"
             f"表1总数：{stats['表1总数']}\n"
@@ -674,6 +754,8 @@ class SqlDiffApp:
             f"相似SQL类数：{stats['相似类数']}\n"
             f"合并判断相同SQL：{'是' if relaxed_match else '否'}\n"
             f"表内去重：{stats['表内去重']}\n"
+            f"是否上传表数据量统计：{'是' if self.use_table_stats_var.get() else '否'}\n"
+            f"表数据量统计文件：{stats_file_desc}\n"
             f"大表阈值：{stats['大表阈值']}\n\n"
             "生成内容：\n"
             f"1. 原表_{Path(file1).stem}\n"
