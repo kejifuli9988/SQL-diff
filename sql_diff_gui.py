@@ -93,8 +93,8 @@ def classify_sql(sql: str) -> str:
     return "其他"
 
 
-def build_similarity_signature(sql: str) -> str:
-    s = normalize_sql(sql).lower()
+def build_similarity_signature(sql: str, ignore_whitespace: bool = True) -> str:
+    s = normalize_sql(sql, ignore_whitespace=ignore_whitespace).lower()
     s = re.sub(r"'(?:''|[^'])*'", "?str?", s)
     s = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?: \d{1,2}:\d{1,2}:\d{1,2})?\b", "?date?", s)
     s = re.sub(r"\b\d{8}\b", "?date8?", s)
@@ -105,23 +105,23 @@ def build_similarity_signature(sql: str) -> str:
     return s
 
 
-def build_date_only_signature(sql: str) -> str:
-    s = normalize_sql(sql).lower()
+def build_date_only_signature(sql: str, ignore_whitespace: bool = True) -> str:
+    s = normalize_sql(sql, ignore_whitespace=ignore_whitespace).lower()
     s = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?: \d{1,2}:\d{1,2}:\d{1,2})?\b", "?date?", s)
     s = re.sub(r"\b\d{8}\b", "?date8?", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def build_inlist_signature(sql: str) -> str:
-    s = normalize_sql(sql).lower()
+def build_inlist_signature(sql: str, ignore_whitespace: bool = True) -> str:
+    s = normalize_sql(sql, ignore_whitespace=ignore_whitespace).lower()
     s = re.sub(r"\bin\s*\((?:[^()]*?)\)", "in(?list?)", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def build_parameter_signature(sql: str) -> str:
-    s = normalize_sql(sql).lower()
+def build_parameter_signature(sql: str, ignore_whitespace: bool = True) -> str:
+    s = normalize_sql(sql, ignore_whitespace=ignore_whitespace).lower()
     s = re.sub(r"'(?:''|[^'])*'", "?str?", s)
     s = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?: \d{1,2}:\d{1,2}:\d{1,2})?\b", "?date?", s)
     s = re.sub(r"\b\d{8}\b", "?date8?", s)
@@ -332,19 +332,23 @@ def build_similarity_reports(
     start_row2: int,
     large_table_map: Optional[Dict[str, int]] = None,
     enrich_columns: Optional[List[str]] = None,
+    ignore_whitespace: bool = True,
+    deduplicate_within_file: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     detail_rows: List[Dict[str, object]] = []
     files = [(Path(file1).name, df1, start_row1), (Path(file2).name, df2, start_row2)]
 
     for file_name, df, start_row in files:
         for idx, row in df.reset_index(drop=True).iterrows():
-            sql = normalize_sql(row.get(SQL_COLUMN_NAME))
+            raw_sql = row.get(SQL_COLUMN_NAME)
+            sql = normalize_sql(raw_sql, ignore_whitespace=False)
             if not sql:
                 continue
-            strict_signature = build_similarity_signature(sql)
-            date_signature = build_date_only_signature(sql)
-            inlist_signature = build_inlist_signature(sql)
-            parameter_signature = build_parameter_signature(sql)
+            compare_sql_key = normalize_sql(raw_sql, ignore_whitespace=ignore_whitespace)
+            strict_signature = build_similarity_signature(sql, ignore_whitespace=ignore_whitespace)
+            date_signature = build_date_only_signature(sql, ignore_whitespace=ignore_whitespace)
+            inlist_signature = build_inlist_signature(sql, ignore_whitespace=ignore_whitespace)
+            parameter_signature = build_parameter_signature(sql, ignore_whitespace=ignore_whitespace)
             strict_class_id = "S" + hashlib.md5(strict_signature.encode("utf-8")).hexdigest()[:8].upper()
             raw_fingerprint = row.get("指纹", "") if "指纹" in df.columns else ""
             detail_rows.append(
@@ -360,6 +364,7 @@ def build_similarity_reports(
                     "日期归一特征": date_signature,
                     "IN归一特征": inlist_signature,
                     "参数归一特征": parameter_signature,
+                    "_compare_sql_key": compare_sql_key,
                     "SQL涉及表": "、".join(extract_table_names(sql)),
                 }
             )
@@ -370,8 +375,15 @@ def build_similarity_reports(
     if detail_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
+    summary_source_df = detail_df.copy()
+    if deduplicate_within_file:
+        summary_source_df = summary_source_df.drop_duplicates(
+            subset=["来源文件", "_compare_sql_key"],
+            keep="first",
+        ).copy()
+
     summary_rows = []
-    for class_id, grp in detail_df.groupby("相似类ID", sort=False):
+    for class_id, grp in summary_source_df.groupby("相似类ID", sort=False):
         if grp["来源文件"].nunique() < 2:
             summary_rows.append(build_summary_row(grp, class_id, "仅单表出现", "否", large_table_map, enrich_columns))
             continue
@@ -401,6 +413,7 @@ def build_similarity_reports(
         ascending=[False, False],
     )
 
+    detail_df = detail_df.drop(columns=["_compare_sql_key"])
     return summary_df, detail_df
 
 
@@ -479,6 +492,8 @@ def compare_sql_files(
         start_row2=start_row2,
         large_table_map=large_table_map,
         enrich_columns=enrich_columns or [],
+        ignore_whitespace=ignore_whitespace,
+        deduplicate_within_file=deduplicate_within_file,
     )
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
