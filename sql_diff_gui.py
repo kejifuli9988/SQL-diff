@@ -382,8 +382,17 @@ def load_excel(file_path: str) -> pd.DataFrame:
         try:
             return pd.read_excel(file_path, engine="xlrd", header=None)
         except Exception:
-            tables = pd.read_html(file_path, header=None)
-            return tables[0]
+            html_errors = []
+            for encoding in ("utf-8", "gb18030", "gbk", None):
+                try:
+                    if encoding is None:
+                        tables = pd.read_html(file_path, header=None)
+                    else:
+                        tables = pd.read_html(file_path, header=None, encoding=encoding)
+                    return tables[0]
+                except Exception as exc:
+                    html_errors.append(f"{encoding or 'auto'}: {exc}")
+            raise ValueError("无法按 HTML 方式读取该 .xls 文件；尝试编码失败：" + " | ".join(html_errors))
 
     raise ValueError(f"不支持的文件类型: {suffix}")
 
