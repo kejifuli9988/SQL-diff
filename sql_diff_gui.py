@@ -265,7 +265,17 @@ def build_summary_row(
 
 
 def clean_col_name(value: object) -> str:
-    return str(value).replace("\n", "").replace("\r", "").replace(" ", "").strip()
+    text = str(value)
+    text = (
+        text.replace("\ufeff", "")
+        .replace("\u200b", "")
+        .replace("\u200c", "")
+        .replace("\u200d", "")
+        .replace("\u00a0", " ")
+        .replace("\u3000", " ")
+    )
+    text = re.sub(r"\s+", "", text)
+    return text.strip()
 
 
 def load_excel(file_path: str) -> pd.DataFrame:
