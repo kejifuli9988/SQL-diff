@@ -224,6 +224,89 @@ def infer_cross_file_reason(grp: pd.DataFrame) -> Tuple[str, str]:
     return "否", "结构相似"
 
 
+def infer_performance_cause(
+    sql: str,
+    sql_type: str,
+    matched_tables: List[str],
+    large_table_map: Optional[Dict[str, int]] = None,
+) -> Tuple[str, str, str]:
+    normalized = normalize_sql(sql, ignore_whitespace=True).lower()
+    join_count = len(re.findall(r"\bjoin\b", normalized))
+    in_items = re.search(r"\bin\s*\(([^()]*)\)", normalized)
+    in_count = 0
+    if in_items:
+        content = in_items.group(1).strip()
+        if content:
+            in_count = len([x for x in content.split(",") if x.strip()])
+
+    has_between_date = bool(
+        re.search(r"\bbetween\b.*?(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\?date\?)", normalized)
+    )
+    has_order_group = any(token in normalized for token in [" order by ", " group by ", " distinct "])
+    has_select_all = normalized.startswith("select *") or " select * " in normalized
+    has_exists = " exists (" in normalized or " not exists (" in normalized
+    has_union = " union " in normalized
+    has_paging = "rownum" in normalized or " limit " in normalized or " offset " in normalized
+    has_large_tables = bool(matched_tables)
+    has_count = normalized.startswith("select count(")
+    where_clause = normalized.split(" where ", 1)[1] if " where " in normalized else ""
+    equality_count = len(re.findall(r"[a-zA-Z0-9_.$]+\s*=\s*(?:\?|:\w+|'[^']*'|\d+)", where_clause))
+
+    if has_large_tables and sql_type in {"普通SELECT", "COUNT查询", "WITH查询"} and equality_count <= 1:
+        return (
+            "大表扫描",
+            f"命中大表：{'、'.join(matched_tables)}；过滤条件较弱",
+            "优先检查索引、过滤条件和是否能缩小扫描范围",
+        )
+    if has_paging:
+        return (
+            "分页过深",
+            "命中分页语法（rownum/limit/offset）",
+            "考虑改为基于索引的游标/主键翻页，避免深分页",
+        )
+    if in_count >= 10:
+        return (
+            "IN列表过长",
+            f"检测到 IN 列表项较多（约 {in_count} 项）",
+            "考虑临时表/批量表关联，或拆分请求减少 IN 列表长度",
+        )
+    if has_between_date:
+        return (
+            "时间范围过大",
+            "检测到时间区间过滤",
+            "检查是否能缩短时间窗口，或按时间字段建立更合适索引",
+        )
+    if join_count >= 3 or has_exists or has_union:
+        return (
+            "多表关联复杂",
+            f"检测到 {join_count} 个 JOIN，或存在 EXISTS/UNION",
+            "优先检查关联顺序、驱动表、索引和是否可拆分查询",
+        )
+    if has_order_group or has_count:
+        return (
+            "排序或聚合代价高",
+            "检测到 ORDER BY / GROUP BY / DISTINCT / COUNT",
+            "检查排序字段、分组字段索引，评估是否可减少聚合范围",
+        )
+    if sql_type in {"INSERT", "UPDATE", "DELETE"}:
+        return (
+            "写入或更新代价高",
+            "属于 INSERT / UPDATE / DELETE 语句",
+            "检查更新条件索引、锁竞争和批量写入方式",
+        )
+    if has_select_all:
+        return (
+            "返回列过多",
+            "检测到 SELECT * 或宽字段查询",
+            "只返回必要字段，避免大对象或宽表整行拉取",
+        )
+    return (
+        "规则暂未明确归类",
+        "未命中当前主要慢SQL规则",
+        "建议结合执行计划、索引和表统计信息进一步分析",
+    )
+
+
 def build_summary_row(
     grp: pd.DataFrame,
     class_id: str,
@@ -231,6 +314,7 @@ def build_summary_row(
     has_exact_match: str,
     large_table_map: Optional[Dict[str, int]] = None,
     enrich_columns: Optional[List[str]] = None,
+    include_performance_rules: bool = False,
 ) -> Dict[str, object]:
     positions = []
     for file_name, sub in grp.groupby("来源文件", sort=False):
@@ -261,6 +345,16 @@ def build_summary_row(
         summary_row[col] = merge_group_values(grp[col]) if col in grp.columns else ""
     summary_row["规则判断是否有大表"] = "是" if matched_tables else "否"
     summary_row["规则判断涉及到的大表名称"] = "、".join(matched_tables)
+    if include_performance_rules:
+        performance_cause, performance_basis, optimization_hint = infer_performance_cause(
+            sql=str(grp["SQL语句"].iloc[0]),
+            sql_type=str(grp["SQL类型"].iloc[0]),
+            matched_tables=matched_tables,
+            large_table_map=large_table_map,
+        )
+        summary_row["规则判断慢SQL原因"] = performance_cause
+        summary_row["规则判断依据"] = performance_basis
+        summary_row["规则判断优化方向"] = optimization_hint
     return summary_row
 
 
@@ -344,6 +438,7 @@ def build_similarity_reports(
     enrich_columns: Optional[List[str]] = None,
     ignore_whitespace: bool = True,
     deduplicate_within_file: bool = False,
+    include_performance_rules: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     detail_rows: List[Dict[str, object]] = []
     files = [(Path(file1).name, df1, start_row1), (Path(file2).name, df2, start_row2)]
@@ -392,10 +487,20 @@ def build_similarity_reports(
             keep="first",
         ).copy()
 
-    summary_rows = []
+        summary_rows = []
     for class_id, grp in summary_source_df.groupby("相似类ID", sort=False):
         if grp["来源文件"].nunique() < 2:
-            summary_rows.append(build_summary_row(grp, class_id, "仅单表出现", "否", large_table_map, enrich_columns))
+            summary_rows.append(
+                build_summary_row(
+                    grp,
+                    class_id,
+                    "仅单表出现",
+                    "否",
+                    large_table_map,
+                    enrich_columns,
+                    include_performance_rules,
+                )
+            )
             continue
 
         file_names = list(grp["来源文件"].drop_duplicates())
@@ -407,16 +512,46 @@ def build_similarity_reports(
         if exact_overlap:
             exact_grp = grp[grp["SQL语句"].astype(str).isin(exact_overlap)].copy()
             if not exact_grp.empty:
-                summary_rows.append(build_summary_row(exact_grp, class_id, "跨表完全相同", "是", large_table_map, enrich_columns))
+                summary_rows.append(
+                    build_summary_row(
+                        exact_grp,
+                        class_id,
+                        "跨表完全相同",
+                        "是",
+                        large_table_map,
+                        enrich_columns,
+                        include_performance_rules,
+                    )
+                )
                 consumed_indexes.update(set(exact_grp.index.tolist()))
 
         remaining_grp = grp.loc[~grp.index.isin(consumed_indexes)].copy()
         if not remaining_grp.empty:
             if exact_overlap:
-                summary_rows.append(build_summary_row(remaining_grp, class_id, "单表内完全相同", "否", large_table_map, enrich_columns))
+                summary_rows.append(
+                    build_summary_row(
+                        remaining_grp,
+                        class_id,
+                        "单表内完全相同",
+                        "否",
+                        large_table_map,
+                        enrich_columns,
+                        include_performance_rules,
+                    )
+                )
             else:
                 has_exact_match, cross_reason = infer_cross_file_reason(remaining_grp)
-                summary_rows.append(build_summary_row(remaining_grp, class_id, cross_reason, has_exact_match, large_table_map, enrich_columns))
+                summary_rows.append(
+                    build_summary_row(
+                        remaining_grp,
+                        class_id,
+                        cross_reason,
+                        has_exact_match,
+                        large_table_map,
+                        enrich_columns,
+                        include_performance_rules,
+                    )
+                )
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
         ["重复条数", "涉及文件数"],
@@ -436,6 +571,7 @@ def compare_sql_files(
     table_stats_file: str = "",
     large_table_threshold: int = 1000000,
     enrich_columns: Optional[List[str]] = None,
+    include_performance_rules: bool = False,
 ) -> Tuple[str, Dict[str, int], pd.DataFrame, pd.DataFrame]:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -504,6 +640,7 @@ def compare_sql_files(
         enrich_columns=enrich_columns or [],
         ignore_whitespace=ignore_whitespace,
         deduplicate_within_file=deduplicate_within_file,
+        include_performance_rules=include_performance_rules,
     )
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -543,6 +680,7 @@ class SqlDiffApp:
         self.output_dir_var = tk.StringVar(value=str(Path.home() / "Desktop"))
         self.large_table_threshold_var = tk.StringVar(value="1000000")
         self.relaxed_match_var = tk.BooleanVar(value=True)
+        self.include_performance_rules_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="请选择两个 Excel 文件和输出目录。")
         self.status_text: Optional[tk.Text] = None
         self.history_enrich_columns = load_enrich_columns_config()
@@ -584,6 +722,12 @@ class SqlDiffApp:
             text="合并判断相同SQL（忽略空白差异，并合并同一文件内重复SQL）",
             variable=self.relaxed_match_var,
         ).pack(anchor="w")
+
+        ttk.Checkbutton(
+            option_frame,
+            text="规则判断慢SQL原因（在相似SQL归类汇总中增加原因/依据/优化方向三列）",
+            variable=self.include_performance_rules_var,
+        ).pack(anchor="w", pady=(6, 0))
 
         tip = ttk.Label(
             option_frame,
@@ -895,6 +1039,7 @@ class SqlDiffApp:
             self._append_status(f"表数据量统计文件：{table_stats_file}")
             self._append_status(f"大表阈值：{large_table_threshold}")
         self._append_status(f"合并判断相同SQL：{'是' if self.relaxed_match_var.get() else '否'}")
+        self._append_status(f"规则判断慢SQL原因：{'是' if self.include_performance_rules_var.get() else '否'}")
         self.root.update_idletasks()
 
         try:
@@ -920,6 +1065,7 @@ class SqlDiffApp:
                 table_stats_file=table_stats_file,
                 large_table_threshold=large_table_threshold,
                 enrich_columns=self.history_enrich_columns,
+                include_performance_rules=self.include_performance_rules_var.get(),
             )
             self._append_status("比较处理完成，正在整理结果信息...")
         except BadZipFile:
@@ -951,6 +1097,7 @@ class SqlDiffApp:
             f"是否上传表数据量统计：{'是' if self.use_table_stats_var.get() else '否'}\n"
             f"表数据量统计文件：{stats_file_desc}\n"
             f"大表阈值：{stats['大表阈值']}\n\n"
+            f"规则判断慢SQL原因：{'是' if self.include_performance_rules_var.get() else '否'}\n"
             f"汇总附加字段数：{len(self.history_enrich_columns)}\n\n"
             "生成内容：\n"
             f"1. 原表_{Path(file1).stem}\n"
@@ -1004,7 +1151,9 @@ class SqlDiffApp:
             "1. 是否存在完全相同SQL：表示两个表里是否出现过完全一致的原始 SQL。\n"
             "2. 跨表原因：可能是“跨表完全相同 / 单表内完全相同 / 仅日期不同 / IN列表不同 / 仅参数不同 / 结构相似 / 仅单表出现”。\n"
             "3. 对应表内第几条：显示这一类 SQL 分别出现在各原表里的第几条，方便回原表定位。\n"
-            "4. 规则判断是否有大表 / 规则判断涉及到的大表名称：基于“表数据量统计”文件中的表名和记录数判断。"
+            "4. 如果勾选“规则判断慢SQL原因”，会额外生成“规则判断慢SQL原因 / 规则判断依据 / 规则判断优化方向”三列。\n"
+            "5. 这三列基于 SQL 结构特征做规则推断，用于辅助归类，不代表数据库已实锤慢因。\n"
+            "6. 规则判断是否有大表 / 规则判断涉及到的大表名称：基于“表数据量统计”文件中的表名和记录数判断。"
         )
         messagebox.showinfo("规则说明", message)
 
