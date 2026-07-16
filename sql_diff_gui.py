@@ -1028,7 +1028,7 @@ def build_summary_row(
             matched_tables=matched_tables,
             large_table_map=large_table_map,
         )
-        summary_row["规则判断慢SQL原因"] = performance_cause
+        summary_row["利用规则判断慢SQL原因"] = performance_cause
         summary_row["规则判断依据"] = performance_basis
         summary_row["规则判断优化方向"] = optimization_hint
     return summary_row
@@ -1110,6 +1110,20 @@ def build_dataframe_from_rows(rows: Iterable[pd.Series], columns: Iterable[str])
     if not rows:
         return pd.DataFrame(columns=list(columns))
     return pd.DataFrame(rows, columns=list(columns))
+
+
+def select_active_enrich_columns(
+    configured_columns: Optional[List[str]],
+    dataframes: Iterable[pd.DataFrame],
+) -> List[str]:
+    if not configured_columns:
+        return []
+
+    available_columns: Set[str] = set()
+    for df in dataframes:
+        available_columns.update(str(col) for col in df.columns)
+
+    return [col for col in configured_columns if col in available_columns]
 
 
 def build_similarity_reports(
@@ -1320,6 +1334,7 @@ def compare_sql_files(
     raw_df2 = df2.copy()
     detail_df1 = df1.copy()
     detail_df2 = df2.copy()
+    active_enrich_columns = select_active_enrich_columns(enrich_columns, [detail_df1, detail_df2])
 
     df1["_compare_sql_key"] = df1[SQL_COLUMN_NAME].apply(lambda x: normalize_sql(x, ignore_whitespace))
     df2["_compare_sql_key"] = df2[SQL_COLUMN_NAME].apply(lambda x: normalize_sql(x, ignore_whitespace))
@@ -1375,7 +1390,7 @@ def compare_sql_files(
         start_row1=start_row1,
         start_row2=start_row2,
         large_table_map=large_table_map,
-        enrich_columns=enrich_columns or [],
+        enrich_columns=active_enrich_columns,
         ignore_whitespace=ignore_whitespace,
         deduplicate_within_file=deduplicate_within_file,
         include_performance_rules=include_performance_rules,
@@ -1587,8 +1602,8 @@ class SqlDiffApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("SQL 语句 Excel 比较工具")
-        self.root.geometry("680x630")
-        self.root.minsize(600, 400)
+        self.root.geometry("680x700")
+        self.root.minsize(680, 500)
 
         self.file1_var = tk.StringVar()
         self.file2_var = tk.StringVar()
@@ -1602,10 +1617,8 @@ class SqlDiffApp:
         self.status_var = tk.StringVar(value="请选择两个 Excel 文件和输出目录。")
         self.status_text: Optional[tk.Text] = None
         self.history_enrich_columns = load_enrich_columns_config()
-        self.enrich_columns_label_var = tk.StringVar()
 
         self._build_ui()
-        self._refresh_enrich_columns_label()
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self.root, padding=20)
@@ -1658,7 +1671,7 @@ class SqlDiffApp:
 
         ttk.Checkbutton(
             option_frame,
-            text="规则判断慢SQL原因（在相似SQL归类汇总中增加原因/依据/优化方向三列）",
+            text="利用规则判断慢SQL原因（在相似SQL归类汇总中增加原因/依据/优化方向三列）",
             variable=self.include_performance_rules_var,
         ).pack(anchor="w", pady=(6, 0))
 
@@ -1686,13 +1699,6 @@ class SqlDiffApp:
         ttk.Button(button_frame, text="打开输出目录", command=self.open_output_dir).pack(side="left", padx=(12, 0))
         ttk.Button(button_frame, text="规则说明", command=self.show_rules).pack(side="left", padx=(12, 0))
         ttk.Button(button_frame, text="汇总字段设置", command=self.open_enrich_columns_dialog).pack(side="left", padx=(12, 0))
-
-        ttk.Label(
-            frame,
-            textvariable=self.enrich_columns_label_var,
-            foreground="#666666",
-            justify="left",
-        ).pack(anchor="w", pady=(0, 10))
 
         status_title = ttk.Label(frame, text="运行状态", font=("Microsoft YaHei UI", 10, "bold"))
         status_title.pack(anchor="w", pady=(8, 6))
@@ -1783,16 +1789,6 @@ class SqlDiffApp:
         self.status_text.see("end")
         self.status_text.configure(state="disabled")
         self.status_var.set(message)
-
-    def _refresh_enrich_columns_label(self) -> None:
-        preview = "、".join(self.history_enrich_columns[:4])
-        if len(self.history_enrich_columns) > 4:
-            preview += " 等"
-        if not preview:
-            preview = "未配置"
-        self.enrich_columns_label_var.set(
-            f"相似SQL归类汇总附加字段：共 {len(self.history_enrich_columns)} 个，当前为：{preview}"
-        )
 
     def open_enrich_columns_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
@@ -1900,7 +1896,6 @@ class SqlDiffApp:
                     deduped.append(col)
             self.history_enrich_columns = deduped
             save_enrich_columns_config(self.history_enrich_columns)
-            self._refresh_enrich_columns_label()
             self._append_status(f"已更新汇总附加字段配置：共 {len(self.history_enrich_columns)} 个。")
             dialog.destroy()
 
@@ -1973,7 +1968,7 @@ class SqlDiffApp:
             self._append_status(f"大表阈值：{large_table_threshold}")
         self._append_status(f"对比方式：{'智能匹配' if self.compare_mode_var.get() == COMPARE_MODE_SMART else '严格匹配'}")
         self._append_status(f"合并判断相同SQL：{'是' if self.relaxed_match_var.get() else '否'}")
-        self._append_status(f"规则判断慢SQL原因：{'是' if self.include_performance_rules_var.get() else '否'}")
+        self._append_status(f"利用规则判断慢SQL原因：{'是' if self.include_performance_rules_var.get() else '否'}")
         self.root.update_idletasks()
 
         try:
@@ -2033,7 +2028,7 @@ class SqlDiffApp:
             f"是否上传表数据量统计：{'是' if self.use_table_stats_var.get() else '否'}\n"
             f"表数据量统计文件：{stats_file_desc}\n"
             f"大表阈值：{stats['大表阈值']}\n\n"
-            f"规则判断慢SQL原因：{'是' if self.include_performance_rules_var.get() else '否'}\n"
+            f"利用规则判断慢SQL原因：{'是' if self.include_performance_rules_var.get() else '否'}\n"
             f"汇总附加字段数：{len(self.history_enrich_columns)}\n\n"
             "生成内容：\n"
             f"1. 原表_{Path(file1).stem}\n"
@@ -2089,7 +2084,7 @@ class SqlDiffApp:
             "3. 对应表内第几条：显示这一类 SQL 分别出现在各原表里的第几条，方便回原表定位。\n"
             "4. 共有(表1) / 共有(表2) 会只保留当前表这一组里的第一条，并在“对方表第几条”里展示整组对应关系。\n"
             "5. 仅表1 / 仅表2 里如果存在同表内多条归成一组，会显示“匹配方式 / 匹配原因 / 组内匹配条目”。\n"
-            "6. 如果勾选“规则判断慢SQL原因”，会额外生成“规则判断慢SQL原因 / 规则判断依据 / 规则判断优化方向”三列；这三列基于 SQL 结构特征做规则推断，用于辅助归类，不代表数据库已实锤慢因。\n"
+            "6. 如果勾选“利用规则判断慢SQL原因”，会额外生成“利用规则判断慢SQL原因 / 规则判断依据 / 规则判断优化方向”三列；这三列基于 SQL 结构特征做规则推断，用于辅助归类，不代表数据库已实锤慢因。\n"
             "7. 规则判断是否有大表 / 规则判断涉及到的大表名称：基于“表数据量统计”文件中的表名和记录数判断。"
         )
         messagebox.showinfo("规则说明", message)
