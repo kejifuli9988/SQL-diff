@@ -4,6 +4,7 @@ import sys
 import traceback
 import hashlib
 import json
+from difflib import SequenceMatcher
 from zipfile import BadZipFile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -16,6 +17,8 @@ from tkinter import filedialog, messagebox, ttk
 SQL_COLUMN_NAME = "SQL语句"
 TABLE_STATS_NAME_COLUMN = "表名"
 TABLE_STATS_ROWS_COLUMN = "记录数"
+COMPARE_MODE_STRICT = "strict"
+COMPARE_MODE_SMART = "smart"
 DEFAULT_HISTORY_ENRICH_COLUMNS = [
     "服务",
     "大表且暂不优化",
@@ -130,6 +133,604 @@ def build_parameter_signature(sql: str, ignore_whitespace: bool = True) -> str:
     return s
 
 
+def build_paging_signature(sql: str, ignore_whitespace: bool = True) -> str:
+    s = normalize_sql(sql, ignore_whitespace=ignore_whitespace).lower()
+    s = re.sub(r"rownum_\s*>\s*\d+", "rownum_>?page?", s)
+    s = re.sub(r"rownum_\s*<=\s*\d+", "rownum_<=?page?", s)
+    s = re.sub(r"\blimit\s+\d+\b", "limit ?page?", s)
+    s = re.sub(r"\boffset\s+\d+\b", "offset ?page?", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _find_top_level_keyword(sql: str, keyword: str) -> int:
+    pattern = keyword.lower()
+    text = sql.lower()
+    depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and text.startswith(pattern, i):
+            prev_ok = i == 0 or not text[i - 1].isalnum()
+            end = i + len(pattern)
+            next_ok = end >= len(text) or not text[end].isalnum()
+            if prev_ok and next_ok:
+                return i
+        i += 1
+    return -1
+
+
+def build_select_body_signature(sql: str, ignore_whitespace: bool = True) -> str:
+    s = normalize_sql(sql, ignore_whitespace=ignore_whitespace).lower()
+    if not s.startswith("select "):
+        return s
+    from_idx = _find_top_level_keyword(s, " from ")
+    if from_idx == -1:
+        return s
+    body = s[from_idx:]
+    body = re.sub(r"'(?:''|[^'])*'", "?str?", body)
+    body = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?: \d{1,2}:\d{1,2}:\d{1,2})?\b", "?date?", body)
+    body = re.sub(r"\b\d{8}\b", "?date8?", body)
+    body = re.sub(r"\b\d+\b", "?num?", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    return body
+
+
+def build_where_base_signature(sql: str, ignore_whitespace: bool = True) -> str:
+    s = normalize_sql(sql, ignore_whitespace=ignore_whitespace).lower()
+    where_idx = _find_top_level_keyword(s, " where ")
+    if where_idx == -1:
+        return s
+    suffix_starts = []
+    for keyword in [" group by ", " order by ", " union ", " union all ", " having "]:
+        idx = _find_top_level_keyword(s, keyword)
+        if idx > where_idx:
+            suffix_starts.append(idx)
+    tail_idx = min(suffix_starts) if suffix_starts else len(s)
+    prefix = s[:where_idx]
+    suffix = s[tail_idx:]
+    result = prefix + " where ?conds? " + suffix
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
+
+
+def _build_row_signatures(sql: str, ignore_whitespace: bool) -> Dict[str, str]:
+    return {
+        "exact": normalize_sql(sql, ignore_whitespace=ignore_whitespace),
+        "parameter": build_parameter_signature(sql, ignore_whitespace=ignore_whitespace),
+        "date": build_date_only_signature(sql, ignore_whitespace=ignore_whitespace),
+        "inlist": build_inlist_signature(sql, ignore_whitespace=ignore_whitespace),
+        "paging": build_paging_signature(sql, ignore_whitespace=ignore_whitespace),
+        "select_body": build_select_body_signature(sql, ignore_whitespace=ignore_whitespace),
+        "where_base": build_where_base_signature(sql, ignore_whitespace=ignore_whitespace),
+        "similarity": build_similarity_signature(sql, ignore_whitespace=ignore_whitespace),
+    }
+
+
+def _build_match_info(
+    df_self: pd.DataFrame,
+    df_other: pd.DataFrame,
+    ignore_whitespace: bool,
+    compare_mode: str,
+) -> Dict[int, Dict[str, object]]:
+    other_infos = []
+    other_exact_positions: Dict[str, List[int]] = {}
+    for _, row in df_other.reset_index(drop=True).iterrows():
+        sql = str(row.get(SQL_COLUMN_NAME, ""))
+        sigs = _build_row_signatures(sql, ignore_whitespace=ignore_whitespace)
+        source_seq = int(row.get("_source_seq", 0))
+        other_infos.append({"seq": source_seq, "sql": sql, "sigs": sigs})
+        other_exact_positions.setdefault(sigs["exact"], []).append(source_seq)
+
+    result: Dict[int, Dict[str, object]] = {}
+    for _, row in df_self.reset_index(drop=True).iterrows():
+        sql = str(row.get(SQL_COLUMN_NAME, ""))
+        source_seq = int(row.get("_source_seq", 0))
+        sigs = _build_row_signatures(sql, ignore_whitespace=ignore_whitespace)
+
+        exact_positions = other_exact_positions.get(sigs["exact"], [])
+        if exact_positions:
+            result[source_seq] = {
+                "matched": True,
+                "match_type": "完全相同",
+                "match_reason": "完全相同",
+                "other_positions": "、".join(str(x) for x in exact_positions),
+            }
+            continue
+
+        if compare_mode != COMPARE_MODE_SMART:
+            result[source_seq] = {
+                "matched": False,
+                "match_type": "未匹配",
+                "match_reason": "未找到完全相同SQL",
+                "other_positions": "",
+            }
+            continue
+
+        best_match: Optional[Dict[str, object]] = None
+        best_score = 0.0
+        for other in other_infos:
+            other_sigs = other["sigs"]
+            reason = ""
+            if sigs["parameter"] == other_sigs["parameter"]:
+                reason = "仅参数不同"
+            elif sigs["date"] == other_sigs["date"]:
+                reason = "仅日期不同"
+            elif sigs["inlist"] == other_sigs["inlist"]:
+                reason = "IN列表不同"
+            elif sigs["paging"] == other_sigs["paging"] and sigs["exact"] != other_sigs["exact"]:
+                reason = "分页条件不同"
+            elif sigs["select_body"] == other_sigs["select_body"] and sigs["exact"] != other_sigs["exact"]:
+                reason = "SELECT字段增加/减少"
+            elif sigs["where_base"] == other_sigs["where_base"] and sigs["exact"] != other_sigs["exact"]:
+                reason = "WHERE条件增加/减少"
+
+            if reason:
+                best_match = {
+                    "matched": True,
+                    "match_type": "智能匹配",
+                    "match_reason": reason,
+                    "other_positions": str(other["seq"]),
+                }
+                break
+
+            score = SequenceMatcher(None, sigs["similarity"], other_sigs["similarity"]).ratio()
+            if score >= 0.80 and score > best_score:
+                best_score = score
+                best_match = {
+                    "matched": True,
+                    "match_type": "智能匹配",
+                    "match_reason": "高相似度匹配",
+                    "other_positions": str(other["seq"]),
+                }
+
+        if best_match is not None:
+            result[source_seq] = best_match
+        else:
+            result[source_seq] = {
+                "matched": False,
+                "match_type": "未匹配",
+                "match_reason": "未找到符合规则的SQL",
+                "other_positions": "",
+            }
+    return result
+
+
+def _attach_match_columns(
+    df: pd.DataFrame,
+    match_info: Dict[int, Dict[str, object]],
+    matched: bool,
+) -> pd.DataFrame:
+    output = df.copy()
+    match_types = []
+    match_reasons = []
+    other_positions = []
+    keep_mask = []
+    for _, row in output.iterrows():
+        source_seq = int(row.get("_source_seq", 0))
+        info = match_info.get(source_seq, {
+            "matched": False,
+            "match_type": "未匹配",
+            "match_reason": "未找到匹配SQL",
+            "other_positions": "",
+        })
+        keep_mask.append(bool(info["matched"]) == matched)
+        match_types.append(str(info["match_type"]))
+        match_reasons.append(str(info["match_reason"]))
+        other_positions.append(str(info["other_positions"]))
+    output["匹配方式"] = match_types
+    output["匹配原因"] = match_reasons
+    output["对方表第几条"] = other_positions
+    output["组内匹配条目"] = ""
+    output = output[pd.Series(keep_mask, index=output.index)].copy()
+    return output
+
+
+def _apply_single_file_match_labels(
+    df: pd.DataFrame,
+    source_file_name: str,
+    single_file_reason_map: Dict[Tuple[str, int], str],
+    single_file_group_map: Dict[Tuple[str, int], str],
+) -> pd.DataFrame:
+    if df.empty or "_source_seq" not in df.columns:
+        return df
+
+    output = df.copy()
+    for col in ["匹配方式", "匹配原因", "对方表第几条", "组内匹配条目"]:
+        if col not in output.columns:
+            output[col] = ""
+    for idx, row in output.iterrows():
+        key = (source_file_name, int(row.get("_source_seq", 0)))
+        reason = single_file_reason_map.get(key)
+        if reason:
+            output.at[idx, "匹配方式"] = "单表内匹配"
+            output.at[idx, "匹配原因"] = reason
+            output.at[idx, "对方表第几条"] = ""
+            output.at[idx, "组内匹配条目"] = single_file_group_map.get(key, "")
+    return output
+
+
+def _build_single_file_maps_from_summary(
+    summary_df: pd.DataFrame,
+    detail_df: pd.DataFrame,
+) -> Tuple[Dict[Tuple[str, int], str], Dict[Tuple[str, int], str]]:
+    reason_map: Dict[Tuple[str, int], str] = {}
+    group_map: Dict[Tuple[str, int], str] = {}
+    if summary_df.empty or detail_df.empty:
+        return reason_map, group_map
+
+    required_cols = {"相似类ID", "涉及文件数", "重复条数"}
+    if not required_cols.issubset(set(summary_df.columns)):
+        return reason_map, group_map
+
+    single_groups = summary_df[
+        (pd.to_numeric(summary_df["涉及文件数"], errors="coerce").fillna(0).astype(int) == 1)
+        & (pd.to_numeric(summary_df["重复条数"], errors="coerce").fillna(0).astype(int) > 1)
+    ].copy()
+    if single_groups.empty:
+        return reason_map, group_map
+
+    group_ids = set(single_groups["相似类ID"].astype(str).tolist())
+    for group_id in group_ids:
+        grp = detail_df[detail_df["相似类ID"].astype(str) == group_id]
+        if grp.empty:
+            continue
+        reason = infer_single_file_match_reason(grp)
+        grouped_by_file: Dict[str, List[int]] = {}
+        for _, row in grp.iterrows():
+            file_name = str(row["来源文件"])
+            seq = int(row["对应表内第几条"])
+            grouped_by_file.setdefault(file_name, []).append(seq)
+
+        text_parts = []
+        for file_name, seqs in grouped_by_file.items():
+            seq_text = "、".join(str(x) for x in sorted(seqs))
+            text_parts.append(f"{file_name}: {seq_text}")
+        summary_text = " | ".join(text_parts)
+
+        for file_name, seqs in grouped_by_file.items():
+            for seq in seqs:
+                key = (file_name, seq)
+                reason_map[key] = reason
+                group_map[key] = summary_text
+    return reason_map, group_map
+
+
+def _collapse_single_file_match_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "匹配方式" not in df.columns or "组内匹配条目" not in df.columns:
+        return df
+
+    output = df.copy()
+    mask = (
+        output["匹配方式"].astype(str).eq("单表内匹配")
+        & output["组内匹配条目"].astype(str).str.strip().ne("")
+    )
+    if not mask.any():
+        return output
+
+    grouped = output[mask].drop_duplicates(subset=["组内匹配条目"], keep="first")
+    others = output[~mask]
+    output = pd.concat([others, grouped], axis=0).sort_index()
+    return output
+
+
+def _drop_only_sheet_helper_columns(df: pd.DataFrame) -> pd.DataFrame:
+    output = df.copy()
+    removable = [col for col in ["对方表第几条"] if col in output.columns]
+    if removable:
+        output = output.drop(columns=removable)
+    return output
+
+
+def _hide_internal_export_columns(df: pd.DataFrame) -> pd.DataFrame:
+    output = df.copy()
+    hidden_columns = [col for col in ["相似类ID"] if col in output.columns]
+    if hidden_columns:
+        output = output.drop(columns=hidden_columns)
+    return output
+
+
+def _finalize_shared_sheet_columns(df: pd.DataFrame) -> pd.DataFrame:
+    output = df.copy()
+    if "_source_seq" in output.columns:
+        insert_at = len(output.columns)
+        if "序号" in output.columns:
+            insert_at = output.columns.get_loc("序号") + 1
+        elif "匹配方式" in output.columns:
+            insert_at = output.columns.get_loc("匹配方式")
+        output.insert(insert_at, "对应表内第几条", output["_source_seq"].astype(int))
+    return output
+
+
+def _parse_position_text(position_text: object) -> Dict[str, List[int]]:
+    result: Dict[str, List[int]] = {}
+    text = str(position_text)
+    for match in re.finditer(r"([^:；|]+?):\s*([0-9、]+)", text):
+        file_name = match.group(1).strip()
+        if "：" in file_name:
+            file_name = file_name.split("：")[-1].strip()
+        seqs = [int(x) for x in match.group(2).split("、") if x.strip().isdigit()]
+        if file_name and seqs:
+            result.setdefault(file_name, []).extend(seqs)
+    return result
+
+
+def _apply_group_summary_to_shared_sheet(
+    df: pd.DataFrame,
+    source_file_name: str,
+    summary_df: pd.DataFrame,
+    detail_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if (
+        df.empty
+        or "_source_seq" not in df.columns
+        or "相似类ID" not in summary_df.columns
+        or "对应表内第几条" not in summary_df.columns
+        or "相似类ID" not in detail_df.columns
+    ):
+        return df
+
+    shared_summary = summary_df[
+        pd.to_numeric(summary_df.get("涉及文件数"), errors="coerce").fillna(0).astype(int) >= 2
+    ].copy()
+    if shared_summary.empty:
+        return df
+
+    summary_text_by_seq: Dict[int, str] = {}
+    for _, row in shared_summary.iterrows():
+        summary_text = str(row["对应表内第几条"])
+        positions = _parse_position_text(summary_text)
+        for seq in positions.get(source_file_name, []):
+            summary_text_by_seq[seq] = summary_text
+
+    if not summary_text_by_seq:
+        return df
+
+    output = df.copy()
+    for idx, row in output.iterrows():
+        source_seq = int(row.get("_source_seq", 0))
+        summary_text = summary_text_by_seq.get(source_seq)
+        if not summary_text:
+            continue
+        output.at[idx, "对方表第几条"] = summary_text
+    return output
+
+
+def _collapse_shared_sheet_rows(
+    df: pd.DataFrame,
+    source_file_name: str,
+    summary_df: pd.DataFrame,
+    detail_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if df.empty or "_source_seq" not in df.columns or "相似类ID" not in detail_df.columns:
+        return df
+
+    shared_group_ids = set(
+        summary_df.loc[
+            pd.to_numeric(summary_df.get("涉及文件数"), errors="coerce").fillna(0).astype(int) >= 2,
+            "相似类ID",
+        ].astype(str).tolist()
+    )
+    if not shared_group_ids:
+        return df
+
+    all_shared_seqs: Set[int] = set()
+    keep_shared_seqs: Set[int] = set()
+    for _, row in summary_df[
+        summary_df["相似类ID"].astype(str).isin(shared_group_ids)
+    ].iterrows():
+        positions = _parse_position_text(row["对应表内第几条"])
+        seqs = sorted(set(positions.get(source_file_name, [])))
+        if not seqs:
+            continue
+        all_shared_seqs.update(seqs)
+        keep_shared_seqs.add(seqs[0])
+
+    if not all_shared_seqs:
+        return df
+
+    output = df.copy()
+    is_shared_row = output["_source_seq"].astype(int).isin(all_shared_seqs)
+    keep_mask = (~is_shared_row) | output["_source_seq"].astype(int).isin(keep_shared_seqs)
+    output = output[keep_mask].copy()
+    return output
+
+
+def _move_single_file_summary_rows_from_both_to_only(
+    only_df: pd.DataFrame,
+    both_df: pd.DataFrame,
+    source_file_name: str,
+    summary_df: pd.DataFrame,
+    detail_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if (
+        only_df.empty and both_df.empty
+    ) or summary_df.empty or detail_df.empty or "_source_seq" not in both_df.columns:
+        return only_df, both_df
+
+    single_summary = summary_df.loc[
+        summary_df["匹配方式"].astype(str) == "单表内匹配"
+    ].copy()
+    if single_summary.empty:
+        return only_df, both_df
+
+    # Only move groups that truly belong to one file. If the displayed group text
+    # already mentions both files, keep it in shared sheets.
+    single_summary = single_summary[
+        (single_summary["来源文件"].astype(str) == source_file_name)
+        & (pd.to_numeric(single_summary["涉及文件数"], errors="coerce").fillna(0).astype(int) == 1)
+    ].copy()
+    single_group_ids = set(single_summary["相似类ID"].astype(str).tolist())
+    if not single_group_ids:
+        return only_df, both_df
+
+    seqs_to_move = set(
+        detail_df.loc[
+            (detail_df["来源文件"].astype(str) == source_file_name)
+            & (detail_df["相似类ID"].astype(str).isin(single_group_ids)),
+            "对应表内第几条",
+        ].astype(int).tolist()
+    )
+    if not seqs_to_move:
+        return only_df, both_df
+
+    move_mask = both_df["_source_seq"].astype(int).isin(seqs_to_move)
+    if not move_mask.any():
+        return only_df, both_df
+
+    moved_rows = both_df[move_mask].copy()
+    kept_rows = both_df[~move_mask].copy()
+    only_df = pd.concat([only_df, moved_rows], axis=0).sort_index()
+    return only_df, kept_rows
+
+
+def _move_strict_single_side_rows_from_both_to_only(
+    only_df: pd.DataFrame,
+    both_df: pd.DataFrame,
+    source_file_name: str,
+    summary_df: pd.DataFrame,
+    detail_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if (
+        only_df.empty and both_df.empty
+    ) or summary_df.empty or detail_df.empty or "_source_seq" not in both_df.columns:
+        return only_df, both_df
+
+    if "跨表原因" not in summary_df.columns:
+        return only_df, both_df
+
+    target_group_ids = set(
+        summary_df.loc[
+            summary_df["跨表原因"].astype(str) == "仅单表出现",
+            "相似类ID",
+        ].astype(str).tolist()
+    )
+    if not target_group_ids:
+        return only_df, both_df
+
+    seqs_to_move = set(
+        detail_df.loc[
+            (detail_df["来源文件"].astype(str) == source_file_name)
+            & (detail_df["相似类ID"].astype(str).isin(target_group_ids)),
+            "对应表内第几条",
+        ].astype(int).tolist()
+    )
+    if not seqs_to_move:
+        return only_df, both_df
+
+    move_mask = both_df["_source_seq"].astype(int).isin(seqs_to_move)
+    if not move_mask.any():
+        return only_df, both_df
+
+    moved_rows = both_df[move_mask].copy()
+    kept_rows = both_df[~move_mask].copy()
+    only_df = pd.concat([only_df, moved_rows], axis=0).sort_index()
+    return only_df, kept_rows
+
+
+def _sync_shared_summary_rows(
+    only_df: pd.DataFrame,
+    both_df: pd.DataFrame,
+    source_file_name: str,
+    summary_df: pd.DataFrame,
+    detail_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if summary_df.empty or detail_df.empty or "_source_seq" not in only_df.columns:
+        return only_df, both_df
+
+    shared_group_ids = set(
+        summary_df.loc[
+            pd.to_numeric(summary_df.get("涉及文件数"), errors="coerce").fillna(0).astype(int) >= 2,
+            "相似类ID",
+        ].astype(str).tolist()
+    )
+    if not shared_group_ids:
+        return only_df, both_df
+
+    shared_seqs = set(
+        detail_df.loc[
+            (detail_df["来源文件"].astype(str) == source_file_name)
+            & (detail_df["相似类ID"].astype(str).isin(shared_group_ids)),
+            "对应表内第几条",
+        ].astype(int).tolist()
+    )
+    if not shared_seqs:
+        return only_df, both_df
+
+    move_mask = only_df["_source_seq"].astype(int).isin(shared_seqs)
+    if move_mask.any():
+        moved_rows = only_df[move_mask].copy()
+        both_df = pd.concat([both_df, moved_rows], axis=0).sort_index()
+        only_df = only_df[~move_mask].copy()
+    return only_df, both_df
+
+
+def build_smart_group_id(
+    current_file_name: str,
+    current_seq: int,
+    other_file_name: str,
+    other_positions: str,
+) -> str:
+    tokens = [f"{current_file_name}#{current_seq}"]
+    for part in str(other_positions).replace("|", "、").split("、"):
+        value = part.strip()
+        if value:
+            tokens.append(f"{other_file_name}#{value}")
+    canonical = "|".join(sorted(set(tokens)))
+    return "M" + hashlib.md5(canonical.encode("utf-8")).hexdigest()[:8].upper()
+
+
+def build_smart_group_ids_from_detail(detail_df: pd.DataFrame) -> Dict[str, str]:
+    adjacency: Dict[str, Set[str]] = {}
+
+    def ensure_node(node: str) -> None:
+        adjacency.setdefault(node, set())
+
+    for _, row in detail_df.iterrows():
+        file_name = str(row.get("来源文件", ""))
+        source_seq = str(row.get("对应表内第几条", ""))
+        if not file_name or not source_seq:
+            continue
+        node = f"{file_name}#{source_seq}"
+        ensure_node(node)
+        other_file_candidates = [name for name in detail_df["来源文件"].drop_duplicates().tolist() if name != file_name]
+        other_file_name = other_file_candidates[0] if other_file_candidates else ""
+        if not other_file_name:
+            continue
+        for part in str(row.get("对方表第几条", "")).replace("|", "、").split("、"):
+            value = part.strip()
+            if not value:
+                continue
+            other_node = f"{other_file_name}#{value}"
+            ensure_node(other_node)
+            adjacency[node].add(other_node)
+            adjacency[other_node].add(node)
+
+    group_map: Dict[str, str] = {}
+    visited: Set[str] = set()
+    for node in adjacency:
+        if node in visited or not adjacency[node]:
+            continue
+        stack = [node]
+        component = []
+        visited.add(node)
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor in adjacency[current]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        group_id = "M" + hashlib.md5("|".join(sorted(component)).encode("utf-8")).hexdigest()[:8].upper()
+        for item in component:
+            group_map[item] = group_id
+    return group_map
+
+
 def load_large_table_map(file_path: str, threshold: int) -> Dict[str, int]:
     df = pd.read_excel(file_path)
     if TABLE_STATS_NAME_COLUMN not in df.columns or TABLE_STATS_ROWS_COLUMN not in df.columns:
@@ -186,6 +787,67 @@ def merge_group_values(series: pd.Series) -> str:
             seen.add(text)
             values.append(text)
     return " | ".join(values)
+
+
+def build_position_summary(grp: pd.DataFrame, compare_mode: str) -> str:
+    if compare_mode != COMPARE_MODE_SMART or "匹配原因" not in grp.columns:
+        positions = []
+        for file_name, sub in grp.groupby("来源文件", sort=False):
+            seqs = "、".join(str(x) for x in sub["对应表内第几条"].tolist())
+            positions.append(f"{file_name}: {seqs}")
+        return " | ".join(positions)
+
+    if grp["来源文件"].nunique() == 1 and len(grp) > 1:
+        positions = []
+        for file_name, sub in grp.groupby("来源文件", sort=False):
+            seqs = "、".join(str(x) for x in sub["对应表内第几条"].tolist())
+            positions.append(f"{file_name}: {seqs}")
+        return f"单表内匹配：{' | '.join(positions)}"
+
+    sections = []
+    temp = grp.copy()
+    temp["_summary_reason"] = temp["匹配原因"].astype(str)
+    if "匹配方式" in temp.columns:
+        temp.loc[temp["匹配方式"].astype(str) == "完全相同", "_summary_reason"] = "完全相同"
+
+    for reason, reason_grp in temp.groupby("_summary_reason", sort=False):
+        reason_positions = []
+        for file_name, sub in reason_grp.groupby("来源文件", sort=False):
+            seqs = "、".join(str(x) for x in sub["对应表内第几条"].tolist())
+            reason_positions.append(f"{file_name}: {seqs}")
+        sections.append(f"{reason}：{' | '.join(reason_positions)}")
+    return "；".join(sections)
+
+
+def infer_single_file_match_reason(grp: pd.DataFrame) -> str:
+    sqls = grp["SQL语句"].astype(str).tolist()
+    if len(set(sqls)) < len(sqls):
+        return "完全相同"
+
+    parameter_signatures = set(grp["参数归一特征"].astype(str).tolist()) if "参数归一特征" in grp.columns else set()
+    date_signatures = set(grp["日期归一特征"].astype(str).tolist()) if "日期归一特征" in grp.columns else set()
+    inlist_signatures = set(grp["IN归一特征"].astype(str).tolist()) if "IN归一特征" in grp.columns else set()
+
+    if len(parameter_signatures) == 1:
+        return "仅参数不同"
+    if len(date_signatures) == 1:
+        return "仅日期不同"
+    if len(inlist_signatures) == 1:
+        return "IN列表不同"
+
+    paging_signatures = {build_paging_signature(sql, ignore_whitespace=True) for sql in sqls}
+    if len(paging_signatures) == 1:
+        return "分页条件不同"
+
+    select_body_signatures = {build_select_body_signature(sql, ignore_whitespace=True) for sql in sqls}
+    if len(select_body_signatures) == 1:
+        return "SELECT字段增加/减少"
+
+    where_base_signatures = {build_where_base_signature(sql, ignore_whitespace=True) for sql in sqls}
+    if len(where_base_signatures) == 1:
+        return "WHERE条件增加/减少"
+
+    return "高相似度匹配"
 
 
 def infer_cross_file_reason(grp: pd.DataFrame) -> Tuple[str, str]:
@@ -315,12 +977,8 @@ def build_summary_row(
     large_table_map: Optional[Dict[str, int]] = None,
     enrich_columns: Optional[List[str]] = None,
     include_performance_rules: bool = False,
+    compare_mode: str = COMPARE_MODE_STRICT,
 ) -> Dict[str, object]:
-    positions = []
-    for file_name, sub in grp.groupby("来源文件", sort=False):
-        seqs = "、".join(str(x) for x in sub["对应表内第几条"].tolist())
-        positions.append(f"{file_name}: {seqs}")
-
     matched_tables: List[str] = []
     if large_table_map:
         seen: Set[str] = set()
@@ -336,11 +994,29 @@ def build_summary_row(
         "重复条数": len(grp),
         "涉及文件数": grp["来源文件"].nunique(),
         "是否存在完全相同SQL": has_exact_match,
-        "跨表原因": cross_reason,
-        "来源文件": "、".join(grp["来源文件"].drop_duplicates().tolist()),
-        "对应表内第几条": " | ".join(positions),
-        "代表SQL": grp["SQL语句"].iloc[0],
     }
+    if compare_mode == COMPARE_MODE_SMART:
+        if grp["来源文件"].nunique() == 1 and len(grp) > 1:
+            single_file_reason = infer_single_file_match_reason(grp)
+            summary_row["匹配方式"] = "单表内匹配"
+            summary_row["匹配原因"] = single_file_reason
+        else:
+            match_types = grp["匹配方式"].dropna().astype(str).unique().tolist() if "匹配方式" in grp.columns else []
+            match_reasons = []
+            seen_reasons: Set[str] = set()
+            if "匹配方式" in grp.columns and "匹配原因" in grp.columns:
+                for _, row in grp.iterrows():
+                    reason = "完全相同" if str(row.get("匹配方式", "")).strip() == "完全相同" else str(row.get("匹配原因", "")).strip()
+                    if reason and reason not in seen_reasons:
+                        seen_reasons.add(reason)
+                        match_reasons.append(reason)
+            summary_row["匹配方式"] = " | ".join(match_types)
+            summary_row["匹配原因"] = " | ".join(match_reasons)
+    else:
+        summary_row["跨表原因"] = cross_reason
+    summary_row["来源文件"] = "、".join(grp["来源文件"].drop_duplicates().tolist())
+    summary_row["对应表内第几条"] = build_position_summary(grp, compare_mode)
+    summary_row["代表SQL"] = grp["SQL语句"].iloc[0]
     for col in enrich_columns or []:
         summary_row[col] = merge_group_values(grp[col]) if col in grp.columns else ""
     summary_row["规则判断是否有大表"] = "是" if matched_tables else "否"
@@ -448,11 +1124,16 @@ def build_similarity_reports(
     ignore_whitespace: bool = True,
     deduplicate_within_file: bool = False,
     include_performance_rules: bool = False,
+    compare_mode: str = COMPARE_MODE_STRICT,
+    match_info_map: Optional[Dict[str, Dict[int, Dict[str, object]]]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     detail_rows: List[Dict[str, object]] = []
-    files = [(Path(file1).name, df1, start_row1), (Path(file2).name, df2, start_row2)]
+    file1_name = Path(file1).name
+    file2_name = Path(file2).name
+    files = [(file1_name, df1, start_row1), (file2_name, df2, start_row2)]
 
     for file_name, df, start_row in files:
+        other_file_name = file2_name if file_name == file1_name else file1_name
         for idx, row in df.reset_index(drop=True).iterrows():
             raw_sql = row.get(SQL_COLUMN_NAME)
             sql = normalize_sql(raw_sql, ignore_whitespace=False)
@@ -482,6 +1163,11 @@ def build_similarity_reports(
                     "SQL涉及表": "、".join(extract_table_names(sql)),
                 }
             )
+            if compare_mode == COMPARE_MODE_SMART and match_info_map and file_name in match_info_map:
+                match_info = match_info_map[file_name].get(int(row.get("_source_seq", idx + 1)), {})
+                detail_rows[-1]["匹配方式"] = match_info.get("match_type", "")
+                detail_rows[-1]["匹配原因"] = match_info.get("match_reason", "")
+                detail_rows[-1]["对方表第几条"] = match_info.get("other_positions", "")
             for col in enrich_columns or []:
                 detail_rows[-1][col] = row.get(col, "") if col in df.columns else ""
 
@@ -489,14 +1175,21 @@ def build_similarity_reports(
     if detail_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
+    if compare_mode == COMPARE_MODE_SMART and "对方表第几条" in detail_df.columns:
+        smart_group_map = build_smart_group_ids_from_detail(detail_df)
+        if smart_group_map:
+            detail_df["相似类ID"] = detail_df.apply(
+                lambda row: smart_group_map.get(f"{row['来源文件']}#{row['对应表内第几条']}", row["相似类ID"]),
+                axis=1,
+            )
+
     summary_source_df = detail_df.copy()
     if deduplicate_within_file:
         summary_source_df = summary_source_df.drop_duplicates(
             subset=["来源文件", "_compare_sql_key"],
             keep="first",
         ).copy()
-
-        summary_rows = []
+    summary_rows = []
     for class_id, grp in summary_source_df.groupby("相似类ID", sort=False):
         if grp["来源文件"].nunique() < 2:
             summary_rows.append(
@@ -508,6 +1201,29 @@ def build_similarity_reports(
                     large_table_map,
                     enrich_columns,
                     include_performance_rules,
+                    compare_mode,
+                )
+            )
+            continue
+
+        if compare_mode == COMPARE_MODE_SMART:
+            exact_overlap = set()
+            file_names = list(grp["来源文件"].drop_duplicates())
+            if len(file_names) >= 2:
+                file_a = grp[grp["来源文件"] == file_names[0]]
+                file_b = grp[grp["来源文件"] == file_names[1]]
+                exact_overlap = set(file_a["SQL语句"].astype(str)) & set(file_b["SQL语句"].astype(str))
+
+            summary_rows.append(
+                build_summary_row(
+                    grp,
+                    class_id,
+                    "",
+                    "是" if exact_overlap else "否",
+                    large_table_map,
+                    enrich_columns,
+                    include_performance_rules,
+                    compare_mode,
                 )
             )
             continue
@@ -530,6 +1246,7 @@ def build_similarity_reports(
                         large_table_map,
                         enrich_columns,
                         include_performance_rules,
+                        compare_mode,
                     )
                 )
                 consumed_indexes.update(set(exact_grp.index.tolist()))
@@ -546,6 +1263,7 @@ def build_similarity_reports(
                         large_table_map,
                         enrich_columns,
                         include_performance_rules,
+                        compare_mode,
                     )
                 )
             else:
@@ -559,6 +1277,7 @@ def build_similarity_reports(
                         large_table_map,
                         enrich_columns,
                         include_performance_rules,
+                        compare_mode,
                     )
                 )
 
@@ -581,6 +1300,7 @@ def compare_sql_files(
     large_table_threshold: int = 1000000,
     enrich_columns: Optional[List[str]] = None,
     include_performance_rules: bool = False,
+    compare_mode: str = COMPARE_MODE_STRICT,
 ) -> Tuple[str, Dict[str, int], pd.DataFrame, pd.DataFrame]:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -611,17 +1331,26 @@ def compare_sql_files(
         # Keep the helper column for non-deduplicated filtering, then drop it from exported sheets later.
         pass
 
-    keys1 = set(df1["_compare_sql_key"])
-    keys2 = set(df2["_compare_sql_key"])
-    only1_keys = keys1 - keys2
-    only2_keys = keys2 - keys1
-    both_keys = keys1 & keys2
-
     helper_columns = ["_compare_sql_key", "_source_seq", "_excel_row_no"]
-    only1_df = df1[df1["_compare_sql_key"].isin(only1_keys)].drop(columns=helper_columns)
-    only2_df = df2[df2["_compare_sql_key"].isin(only2_keys)].drop(columns=helper_columns)
-    both1_df = df1[df1["_compare_sql_key"].isin(both_keys)].drop(columns=helper_columns)
-    both2_df = df2[df2["_compare_sql_key"].isin(both_keys)].drop(columns=helper_columns)
+    match_info_1: Dict[int, Dict[str, object]] = {}
+    match_info_2: Dict[int, Dict[str, object]] = {}
+    if compare_mode == COMPARE_MODE_SMART:
+        match_info_1 = _build_match_info(df1, df2, ignore_whitespace=ignore_whitespace, compare_mode=compare_mode)
+        match_info_2 = _build_match_info(df2, df1, ignore_whitespace=ignore_whitespace, compare_mode=compare_mode)
+        only1_df = _attach_match_columns(df1, match_info_1, matched=False)
+        only2_df = _attach_match_columns(df2, match_info_2, matched=False)
+        both1_df = _attach_match_columns(df1, match_info_1, matched=True)
+        both2_df = _attach_match_columns(df2, match_info_2, matched=True)
+    else:
+        keys1 = set(df1["_compare_sql_key"])
+        keys2 = set(df2["_compare_sql_key"])
+        only1_keys = keys1 - keys2
+        only2_keys = keys2 - keys1
+        both_keys = keys1 & keys2
+        only1_df = df1[df1["_compare_sql_key"].isin(only1_keys)].copy()
+        only2_df = df2[df2["_compare_sql_key"].isin(only2_keys)].copy()
+        both1_df = df1[df1["_compare_sql_key"].isin(both_keys)].copy()
+        both2_df = df2[df2["_compare_sql_key"].isin(both_keys)].copy()
 
     df1 = df1.drop(columns=["_compare_sql_key"])
     df2 = df2.drop(columns=["_compare_sql_key"])
@@ -650,7 +1379,185 @@ def compare_sql_files(
         ignore_whitespace=ignore_whitespace,
         deduplicate_within_file=deduplicate_within_file,
         include_performance_rules=include_performance_rules,
+        compare_mode=compare_mode,
+        match_info_map={
+            Path(file1).name: match_info_1,
+            Path(file2).name: match_info_2,
+        } if compare_mode == COMPARE_MODE_SMART else None,
     )
+
+    if compare_mode == COMPARE_MODE_SMART and "匹配方式" in similarity_summary_df.columns:
+        only1_df, both1_df = _move_single_file_summary_rows_from_both_to_only(
+            only1_df,
+            both1_df,
+            Path(file1).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        only2_df, both2_df = _move_single_file_summary_rows_from_both_to_only(
+            only2_df,
+            both2_df,
+            Path(file2).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        single_file_reason_map: Dict[Tuple[str, int], str] = {}
+        single_file_group_map: Dict[Tuple[str, int], str] = {}
+        single_summary = similarity_summary_df[
+            similarity_summary_df["匹配方式"].astype(str) == "单表内匹配"
+        ].copy()
+        if not single_summary.empty:
+            reason_by_group = {
+                str(row["相似类ID"]): str(row["匹配原因"])
+                for _, row in single_summary.iterrows()
+            }
+            detail_subset = similarity_detail_df[
+                similarity_detail_df["相似类ID"].astype(str).isin(reason_by_group.keys())
+            ]
+            members_by_group: Dict[str, List[Tuple[str, int]]] = {}
+            for _, row in detail_subset.iterrows():
+                group_id = str(row["相似类ID"])
+                key = (str(row["来源文件"]), int(row["对应表内第几条"]))
+                single_file_reason_map[key] = reason_by_group[group_id]
+                members_by_group.setdefault(group_id, []).append(key)
+            for group_id, members in members_by_group.items():
+                grouped_by_file: Dict[str, List[int]] = {}
+                for file_name, seq in members:
+                    grouped_by_file.setdefault(file_name, []).append(seq)
+                text_parts = []
+                for file_name, seqs in grouped_by_file.items():
+                    seq_text = "、".join(str(x) for x in sorted(seqs))
+                    text_parts.append(f"{file_name}: {seq_text}")
+                summary_text = " | ".join(text_parts)
+                for key in members:
+                    single_file_group_map[key] = summary_text
+        only1_df = _apply_single_file_match_labels(only1_df, Path(file1).name, single_file_reason_map, single_file_group_map)
+        only2_df = _apply_single_file_match_labels(only2_df, Path(file2).name, single_file_reason_map, single_file_group_map)
+        only1_df = _collapse_single_file_match_rows(only1_df)
+        only2_df = _collapse_single_file_match_rows(only2_df)
+        both1_df = _apply_group_summary_to_shared_sheet(
+            both1_df,
+            Path(file1).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both2_df = _apply_group_summary_to_shared_sheet(
+            both2_df,
+            Path(file2).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both1_df = _collapse_shared_sheet_rows(
+            both1_df,
+            Path(file1).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both2_df = _collapse_shared_sheet_rows(
+            both2_df,
+            Path(file2).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        only1_df = only1_df.drop(columns=helper_columns)
+        only2_df = only2_df.drop(columns=helper_columns)
+        only1_df = _drop_only_sheet_helper_columns(only1_df)
+        only2_df = _drop_only_sheet_helper_columns(only2_df)
+        both1_df = _apply_group_summary_to_shared_sheet(
+            both1_df,
+            Path(file1).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both2_df = _apply_group_summary_to_shared_sheet(
+            both2_df,
+            Path(file2).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both1_df = _finalize_shared_sheet_columns(both1_df)
+        both2_df = _finalize_shared_sheet_columns(both2_df)
+        both1_df = both1_df.drop(columns=helper_columns)
+        both2_df = both2_df.drop(columns=helper_columns)
+    elif compare_mode != COMPARE_MODE_SMART:
+        only1_df, both1_df = _move_strict_single_side_rows_from_both_to_only(
+            only1_df,
+            both1_df,
+            Path(file1).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        only2_df, both2_df = _move_strict_single_side_rows_from_both_to_only(
+            only2_df,
+            both2_df,
+            Path(file2).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        only1_df, both1_df = _sync_shared_summary_rows(
+            only1_df,
+            both1_df,
+            Path(file1).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        only2_df, both2_df = _sync_shared_summary_rows(
+            only2_df,
+            both2_df,
+            Path(file2).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        single_file_reason_map, single_file_group_map = _build_single_file_maps_from_summary(
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        only1_df = _apply_single_file_match_labels(
+            only1_df,
+            Path(file1).name,
+            single_file_reason_map,
+            single_file_group_map,
+        )
+        only2_df = _apply_single_file_match_labels(
+            only2_df,
+            Path(file2).name,
+            single_file_reason_map,
+            single_file_group_map,
+        )
+        only1_df = _collapse_single_file_match_rows(only1_df)
+        only2_df = _collapse_single_file_match_rows(only2_df)
+        only1_df = only1_df.drop(columns=helper_columns)
+        only2_df = only2_df.drop(columns=helper_columns)
+        only1_df = _drop_only_sheet_helper_columns(only1_df)
+        only2_df = _drop_only_sheet_helper_columns(only2_df)
+        both1_df = _apply_group_summary_to_shared_sheet(
+            both1_df,
+            Path(file1).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both2_df = _apply_group_summary_to_shared_sheet(
+            both2_df,
+            Path(file2).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both1_df = _collapse_shared_sheet_rows(
+            both1_df,
+            Path(file1).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both2_df = _collapse_shared_sheet_rows(
+            both2_df,
+            Path(file2).name,
+            similarity_summary_df,
+            similarity_detail_df,
+        )
+        both1_df = _finalize_shared_sheet_columns(both1_df)
+        both2_df = _finalize_shared_sheet_columns(both2_df)
+        both1_df = both1_df.drop(columns=helper_columns)
+        both2_df = both2_df.drop(columns=helper_columns)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         raw_df1.drop(columns=["_source_seq", "_excel_row_no"]).to_excel(writer, sheet_name=f"原表_{name1}"[:31], index=False)
@@ -659,8 +1566,8 @@ def compare_sql_files(
         only2_df.to_excel(writer, sheet_name=sheet_only2, index=False)
         both1_df.to_excel(writer, sheet_name=sheet_both1, index=False)
         both2_df.to_excel(writer, sheet_name=sheet_both2, index=False)
-        similarity_summary_df.to_excel(writer, sheet_name="相似SQL归类汇总", index=False)
-        similarity_detail_df.to_excel(writer, sheet_name="相似SQL明细", index=False)
+        _hide_internal_export_columns(similarity_summary_df).to_excel(writer, sheet_name="相似SQL归类汇总", index=False)
+        _hide_internal_export_columns(similarity_detail_df).to_excel(writer, sheet_name="相似SQL明细", index=False)
 
     stats = {
         "表1总数": len(df1),
@@ -671,6 +1578,7 @@ def compare_sql_files(
         "相似类数": len(similarity_summary_df),
         "大表阈值": large_table_threshold,
         "表内去重": "是" if deduplicate_within_file else "否",
+        "对比方式": "智能匹配" if compare_mode == COMPARE_MODE_SMART else "严格匹配",
     }
     return output_path, stats, similarity_summary_df, similarity_detail_df
 
@@ -690,6 +1598,7 @@ class SqlDiffApp:
         self.large_table_threshold_var = tk.StringVar(value="1000000")
         self.relaxed_match_var = tk.BooleanVar(value=True)
         self.include_performance_rules_var = tk.BooleanVar(value=False)
+        self.compare_mode_var = tk.StringVar(value=COMPARE_MODE_STRICT)
         self.status_var = tk.StringVar(value="请选择两个 Excel 文件和输出目录。")
         self.status_text: Optional[tk.Text] = None
         self.history_enrich_columns = load_enrich_columns_config()
@@ -722,9 +1631,24 @@ class SqlDiffApp:
 
         ttk.Label(
             option_frame,
-            text="相同判断规则",
+            text="对比选项",
             font=("Microsoft YaHei UI", 10, "bold"),
         ).pack(anchor="w")
+
+        compare_mode_row = ttk.Frame(option_frame)
+        compare_mode_row.pack(fill="x", pady=(0, 6))
+        ttk.Radiobutton(
+            compare_mode_row,
+            text="严格匹配",
+            variable=self.compare_mode_var,
+            value=COMPARE_MODE_STRICT,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            compare_mode_row,
+            text="智能匹配",
+            variable=self.compare_mode_var,
+            value=COMPARE_MODE_SMART,
+        ).pack(side="left", padx=(12, 0))
 
         ttk.Checkbutton(
             option_frame,
@@ -1047,6 +1971,7 @@ class SqlDiffApp:
         if table_stats_file:
             self._append_status(f"表数据量统计文件：{table_stats_file}")
             self._append_status(f"大表阈值：{large_table_threshold}")
+        self._append_status(f"对比方式：{'智能匹配' if self.compare_mode_var.get() == COMPARE_MODE_SMART else '严格匹配'}")
         self._append_status(f"合并判断相同SQL：{'是' if self.relaxed_match_var.get() else '否'}")
         self._append_status(f"规则判断慢SQL原因：{'是' if self.include_performance_rules_var.get() else '否'}")
         self.root.update_idletasks()
@@ -1075,6 +2000,7 @@ class SqlDiffApp:
                 large_table_threshold=large_table_threshold,
                 enrich_columns=self.history_enrich_columns,
                 include_performance_rules=self.include_performance_rules_var.get(),
+                compare_mode=self.compare_mode_var.get(),
             )
             self._append_status("比较处理完成，正在整理结果信息...")
         except BadZipFile:
@@ -1101,6 +2027,7 @@ class SqlDiffApp:
             f"仅表2：{stats['仅表2']}\n"
             f"共有：{stats['共有']}\n"
             f"相似SQL类数：{stats['相似类数']}\n"
+            f"对比方式：{stats['对比方式']}\n"
             f"合并判断相同SQL：{'是' if relaxed_match else '否'}\n"
             f"表内去重：{stats['表内去重']}\n"
             f"是否上传表数据量统计：{'是' if self.use_table_stats_var.get() else '否'}\n"
@@ -1144,8 +2071,8 @@ class SqlDiffApp:
             "1. 以“SQL语句”列作为比较依据。\n"
             "2. 程序会自动在前 30 行里寻找真正表头，不要求第一行就是表头。\n"
             "3. 支持标准 .xlsx / .xlsm / .xls；对部分伪装成 .xls 的 HTML 表格也会尝试兼容读取。\n"
-            "4. “合并判断相同SQL”勾选后，会同时忽略空白差异，并合并同一文件内重复 SQL。\n"
-            "5. 不勾选时，严格按原始 SQL 比较，并保留表内重复行。\n\n"
+            "4. “严格匹配”只把完全匹配的 SQL 视为共有；“智能匹配”会额外识别仅参数不同、仅日期不同、IN列表不同、分页条件不同、SELECT字段增加/减少、WHERE条件增加/减少，以及高相似度匹配。\n"
+            "5. “合并判断相同SQL”勾选后，会同时忽略空白差异，并合并同一文件内重复 SQL；不勾选时，严格按原始 SQL 比较，并保留表内重复行。\n"
             "6. 如果上传“表数据量统计”，程序会根据大表阈值判断相似 SQL 是否涉及大表。\n"
             "7. 可以通过“汇总字段设置”按钮，自定义相似SQL归类汇总要额外带出的表头名。\n\n"
             "二、相似 SQL 归类规则\n"
@@ -1155,14 +2082,15 @@ class SqlDiffApp:
             "4. 日期会替换成 ?date?，8 位日期串会替换成 ?date8?。\n"
             "5. 数字会替换成 ?num?。\n"
             "6. IN (...) 会折叠成 in(?list?)，VALUES (...) 会折叠成 values(?vals?)。\n"
-            "7. 两条 SQL 标准化后完全一致，才会归到同一个“相似类ID”。\n\n"
+            "7. 导出的结果表不会显示内部用的分组编号，直接通过“来源文件 / 对应表内第几条 / 对方表第几条 / 组内匹配条目”等字段来说明分组关系。\n\n"
             "三、汇总表字段说明\n"
             "1. 是否存在完全相同SQL：表示两个表里是否出现过完全一致的原始 SQL。\n"
-            "2. 跨表原因：可能是“跨表完全相同 / 单表内完全相同 / 仅日期不同 / IN列表不同 / 仅参数不同 / 结构相似 / 仅单表出现”。\n"
+            "2. 严格匹配模式下，汇总表主要看“跨表原因”；智能匹配模式下，汇总表主要看“匹配方式 / 匹配原因”。\n"
             "3. 对应表内第几条：显示这一类 SQL 分别出现在各原表里的第几条，方便回原表定位。\n"
-            "4. 如果勾选“规则判断慢SQL原因”，会额外生成“规则判断慢SQL原因 / 规则判断依据 / 规则判断优化方向”三列。\n"
-            "5. 这三列基于 SQL 结构特征做规则推断，用于辅助归类，不代表数据库已实锤慢因。\n"
-            "6. 规则判断是否有大表 / 规则判断涉及到的大表名称：基于“表数据量统计”文件中的表名和记录数判断。"
+            "4. 共有(表1) / 共有(表2) 会只保留当前表这一组里的第一条，并在“对方表第几条”里展示整组对应关系。\n"
+            "5. 仅表1 / 仅表2 里如果存在同表内多条归成一组，会显示“匹配方式 / 匹配原因 / 组内匹配条目”。\n"
+            "6. 如果勾选“规则判断慢SQL原因”，会额外生成“规则判断慢SQL原因 / 规则判断依据 / 规则判断优化方向”三列；这三列基于 SQL 结构特征做规则推断，用于辅助归类，不代表数据库已实锤慢因。\n"
+            "7. 规则判断是否有大表 / 规则判断涉及到的大表名称：基于“表数据量统计”文件中的表名和记录数判断。"
         )
         messagebox.showinfo("规则说明", message)
 
