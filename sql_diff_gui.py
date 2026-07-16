@@ -1126,6 +1126,10 @@ def select_active_enrich_columns(
     return [col for col in configured_columns if col in available_columns]
 
 
+def get_compare_mode_label(compare_mode: str) -> str:
+    return "相似匹配" if compare_mode == COMPARE_MODE_SMART else "严格匹配"
+
+
 def build_similarity_reports(
     file1: str,
     file2: str,
@@ -1372,7 +1376,8 @@ def compare_sql_files(
 
     name1 = Path(file1).stem
     name2 = Path(file2).stem
-    output_path = os.path.join(output_dir, f"SQL比较结果_{name1}_VS_{name2}.xlsx")
+    mode_label = get_compare_mode_label(compare_mode)
+    output_path = os.path.join(output_dir, f"SQL比较结果_{name1}_VS_{name2}_{mode_label}.xlsx")
 
     sheet_only1 = f"仅{name1}"[:31]
     sheet_only2 = f"仅{name2}"[:31]
@@ -1593,7 +1598,7 @@ def compare_sql_files(
         "相似类数": len(similarity_summary_df),
         "大表阈值": large_table_threshold,
         "表内去重": "是" if deduplicate_within_file else "否",
-        "对比方式": "智能匹配" if compare_mode == COMPARE_MODE_SMART else "严格匹配",
+        "对比方式": get_compare_mode_label(compare_mode),
     }
     return output_path, stats, similarity_summary_df, similarity_detail_df
 
@@ -1658,7 +1663,7 @@ class SqlDiffApp:
         ).pack(side="left")
         ttk.Radiobutton(
             compare_mode_row,
-            text="智能匹配",
+            text="相似匹配",
             variable=self.compare_mode_var,
             value=COMPARE_MODE_SMART,
         ).pack(side="left", padx=(12, 0))
@@ -1966,14 +1971,17 @@ class SqlDiffApp:
         if table_stats_file:
             self._append_status(f"表数据量统计文件：{table_stats_file}")
             self._append_status(f"大表阈值：{large_table_threshold}")
-        self._append_status(f"对比方式：{'智能匹配' if self.compare_mode_var.get() == COMPARE_MODE_SMART else '严格匹配'}")
+        self._append_status(f"对比方式：{get_compare_mode_label(self.compare_mode_var.get())}")
         self._append_status(f"合并判断相同SQL：{'是' if self.relaxed_match_var.get() else '否'}")
         self._append_status(f"利用规则判断慢SQL原因：{'是' if self.include_performance_rules_var.get() else '否'}")
         self.root.update_idletasks()
 
         try:
             relaxed_match = self.relaxed_match_var.get()
-            output_name = f"SQL比较结果_{Path(file1).stem}_VS_{Path(file2).stem}.xlsx"
+            output_name = (
+                f"SQL比较结果_{Path(file1).stem}_VS_{Path(file2).stem}_"
+                f"{get_compare_mode_label(self.compare_mode_var.get())}.xlsx"
+            )
             output_path = os.path.join(output_dir, output_name)
             if os.path.exists(output_path):
                 self._append_status(f"检测到同名结果文件：{output_path}")
@@ -2066,7 +2074,7 @@ class SqlDiffApp:
             "1. 以“SQL语句”列作为比较依据。\n"
             "2. 程序会自动在前 30 行里寻找真正表头，不要求第一行就是表头。\n"
             "3. 支持标准 .xlsx / .xlsm / .xls；对部分伪装成 .xls 的 HTML 表格也会尝试兼容读取。\n"
-            "4. “严格匹配”只把完全匹配的 SQL 视为共有；“智能匹配”会额外识别仅参数不同、仅日期不同、IN列表不同、分页条件不同、SELECT字段增加/减少、WHERE条件增加/减少，以及高相似度匹配。\n"
+            "4. “严格匹配”只把完全匹配的 SQL 视为共有；“相似匹配”会额外识别仅参数不同、仅日期不同、IN列表不同、分页条件不同、SELECT字段增加/减少、WHERE条件增加/减少，以及高相似度匹配。\n"
             "5. “合并判断相同SQL”勾选后，会同时忽略空白差异，并合并同一文件内重复 SQL；不勾选时，严格按原始 SQL 比较，并保留表内重复行。\n"
             "6. 如果上传“表数据量统计”，程序会根据大表阈值判断相似 SQL 是否涉及大表。\n"
             "7. 可以通过“汇总字段设置”按钮，自定义相似SQL归类汇总要额外带出的表头名。\n\n"
@@ -2080,7 +2088,7 @@ class SqlDiffApp:
             "7. 导出的结果表不会显示内部用的分组编号，直接通过“来源文件 / 对应表内第几条 / 对方表第几条 / 组内匹配条目”等字段来说明分组关系。\n\n"
             "三、汇总表字段说明\n"
             "1. 是否存在完全相同SQL：表示两个表里是否出现过完全一致的原始 SQL。\n"
-            "2. 严格匹配模式下，汇总表主要看“跨表原因”；智能匹配模式下，汇总表主要看“匹配方式 / 匹配原因”。\n"
+            "2. 严格匹配模式下，汇总表主要看“跨表原因”；相似匹配模式下，汇总表主要看“匹配方式 / 匹配原因”。\n"
             "3. 对应表内第几条：显示这一类 SQL 分别出现在各原表里的第几条，方便回原表定位。\n"
             "4. 共有(表1) / 共有(表2) 会只保留当前表这一组里的第一条，并在“对方表第几条”里展示整组对应关系。\n"
             "5. 仅表1 / 仅表2 里如果存在同表内多条归成一组，会显示“匹配方式 / 匹配原因 / 组内匹配条目”。\n"
