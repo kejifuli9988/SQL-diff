@@ -1019,8 +1019,9 @@ def build_summary_row(
     summary_row["代表SQL"] = grp["SQL语句"].iloc[0]
     for col in enrich_columns or []:
         summary_row[col] = merge_group_values(grp[col]) if col in grp.columns else ""
-    summary_row["规则判断是否有大表"] = "是" if matched_tables else "否"
-    summary_row["规则判断涉及到的大表名称"] = "、".join(matched_tables)
+    if large_table_map is not None:
+        summary_row["规则判断是否有大表"] = "是" if matched_tables else "否"
+        summary_row["规则判断涉及到的大表名称"] = "、".join(matched_tables)
     if include_performance_rules:
         performance_cause, performance_basis, optimization_hint = infer_performance_cause(
             sql=str(grp["SQL语句"].iloc[0]),
