@@ -211,6 +211,23 @@ def _build_row_signatures(sql: str, ignore_whitespace: bool) -> Dict[str, str]:
     }
 
 
+def _append_to_index(index: Dict[str, List[int]], key: str, seq: int) -> None:
+    if not key:
+        return
+    index.setdefault(key, []).append(seq)
+
+
+def _get_similarity_bucket_types(sql_type: str) -> Set[str]:
+    select_like = {"普通SELECT", "分页查询", "COUNT查询", "WITH查询", "SELECT FOR UPDATE"}
+    if sql_type in select_like:
+        return select_like
+    return {sql_type}
+
+
+def _build_similarity_tokens(signature: str) -> Set[str]:
+    return {token for token in re.findall(r"[a-z_?]+", signature) if len(token) >= 2}
+
+
 def _build_match_info(
     df_self: pd.DataFrame,
     df_other: pd.DataFrame,
@@ -219,18 +236,43 @@ def _build_match_info(
 ) -> Dict[int, Dict[str, object]]:
     other_infos = []
     other_exact_positions: Dict[str, List[int]] = {}
+    other_parameter_positions: Dict[str, List[int]] = {}
+    other_date_positions: Dict[str, List[int]] = {}
+    other_inlist_positions: Dict[str, List[int]] = {}
+    other_paging_positions: Dict[str, List[int]] = {}
+    other_select_body_positions: Dict[str, List[int]] = {}
+    other_where_base_positions: Dict[str, List[int]] = {}
+    other_infos_by_type: Dict[str, List[Dict[str, object]]] = {}
     for _, row in df_other.reset_index(drop=True).iterrows():
         sql = str(row.get(SQL_COLUMN_NAME, ""))
         sigs = _build_row_signatures(sql, ignore_whitespace=ignore_whitespace)
         source_seq = int(row.get("_source_seq", 0))
-        other_infos.append({"seq": source_seq, "sql": sql, "sigs": sigs})
-        other_exact_positions.setdefault(sigs["exact"], []).append(source_seq)
+        sql_type = classify_sql(sql)
+        similarity_text = sigs["similarity"]
+        info = {
+            "seq": source_seq,
+            "sql": sql,
+            "sigs": sigs,
+            "sql_type": sql_type,
+            "similarity_len": len(similarity_text),
+            "similarity_tokens": _build_similarity_tokens(similarity_text),
+        }
+        other_infos.append(info)
+        other_infos_by_type.setdefault(sql_type, []).append(info)
+        _append_to_index(other_exact_positions, sigs["exact"], source_seq)
+        _append_to_index(other_parameter_positions, sigs["parameter"], source_seq)
+        _append_to_index(other_date_positions, sigs["date"], source_seq)
+        _append_to_index(other_inlist_positions, sigs["inlist"], source_seq)
+        _append_to_index(other_paging_positions, sigs["paging"], source_seq)
+        _append_to_index(other_select_body_positions, sigs["select_body"], source_seq)
+        _append_to_index(other_where_base_positions, sigs["where_base"], source_seq)
 
     result: Dict[int, Dict[str, object]] = {}
     for _, row in df_self.reset_index(drop=True).iterrows():
         sql = str(row.get(SQL_COLUMN_NAME, ""))
         source_seq = int(row.get("_source_seq", 0))
         sigs = _build_row_signatures(sql, ignore_whitespace=ignore_whitespace)
+        sql_type = classify_sql(sql)
 
         exact_positions = other_exact_positions.get(sigs["exact"], [])
         if exact_positions:
@@ -251,33 +293,94 @@ def _build_match_info(
             }
             continue
 
-        best_match: Optional[Dict[str, object]] = None
+        parameter_positions = other_parameter_positions.get(sigs["parameter"], [])
+        if parameter_positions:
+            result[source_seq] = {
+                "matched": True,
+                "match_type": "智能匹配",
+                "match_reason": "仅参数不同",
+                "other_positions": str(parameter_positions[0]),
+            }
+            continue
+
+        date_positions = other_date_positions.get(sigs["date"], [])
+        if date_positions:
+            result[source_seq] = {
+                "matched": True,
+                "match_type": "智能匹配",
+                "match_reason": "仅日期不同",
+                "other_positions": str(date_positions[0]),
+            }
+            continue
+
+        inlist_positions = other_inlist_positions.get(sigs["inlist"], [])
+        if inlist_positions:
+            result[source_seq] = {
+                "matched": True,
+                "match_type": "智能匹配",
+                "match_reason": "IN列表不同",
+                "other_positions": str(inlist_positions[0]),
+            }
+            continue
+
+        paging_positions = other_paging_positions.get(sigs["paging"], [])
+        if paging_positions:
+            result[source_seq] = {
+                "matched": True,
+                "match_type": "智能匹配",
+                "match_reason": "分页条件不同",
+                "other_positions": str(paging_positions[0]),
+            }
+            continue
+
+        select_body_positions = other_select_body_positions.get(sigs["select_body"], [])
+        if select_body_positions:
+            result[source_seq] = {
+                "matched": True,
+                "match_type": "智能匹配",
+                "match_reason": "SELECT字段增加/减少",
+                "other_positions": str(select_body_positions[0]),
+            }
+            continue
+
+        where_base_positions = other_where_base_positions.get(sigs["where_base"], [])
+        if where_base_positions:
+            result[source_seq] = {
+                "matched": True,
+                "match_type": "智能匹配",
+                "match_reason": "WHERE条件增加/减少",
+                "other_positions": str(where_base_positions[0]),
+            }
+            continue
+
         best_score = 0.0
-        for other in other_infos:
+        best_match: Optional[Dict[str, object]] = None
+        similarity_text = sigs["similarity"]
+        similarity_len = len(similarity_text)
+        similarity_tokens = _build_similarity_tokens(similarity_text)
+        candidate_infos: List[Dict[str, object]] = []
+        for bucket_type in _get_similarity_bucket_types(sql_type):
+            candidate_infos.extend(other_infos_by_type.get(bucket_type, []))
+        if not candidate_infos:
+            candidate_infos = other_infos
+
+        min_len = max(1, int(similarity_len * 0.5))
+        max_len = max(min_len, int(similarity_len * 2.0))
+        for other in candidate_infos:
+            other_len = int(other["similarity_len"])
+            if other_len < min_len or other_len > max_len:
+                continue
             other_sigs = other["sigs"]
-            reason = ""
-            if sigs["parameter"] == other_sigs["parameter"]:
-                reason = "仅参数不同"
-            elif sigs["date"] == other_sigs["date"]:
-                reason = "仅日期不同"
-            elif sigs["inlist"] == other_sigs["inlist"]:
-                reason = "IN列表不同"
-            elif sigs["paging"] == other_sigs["paging"] and sigs["exact"] != other_sigs["exact"]:
-                reason = "分页条件不同"
-            elif sigs["select_body"] == other_sigs["select_body"] and sigs["exact"] != other_sigs["exact"]:
-                reason = "SELECT字段增加/减少"
-            elif sigs["where_base"] == other_sigs["where_base"] and sigs["exact"] != other_sigs["exact"]:
-                reason = "WHERE条件增加/减少"
-
-            if reason:
-                best_match = {
-                    "matched": True,
-                    "match_type": "智能匹配",
-                    "match_reason": reason,
-                    "other_positions": str(other["seq"]),
-                }
-                break
-
+            other_tokens = other["similarity_tokens"]
+            if similarity_tokens and other_tokens:
+                overlap_ratio = len(similarity_tokens & other_tokens) / max(
+                    1, min(len(similarity_tokens), len(other_tokens))
+                )
+                if overlap_ratio < 0.2:
+                    continue
+            quick_score = SequenceMatcher(None, similarity_text, other["sigs"]["similarity"]).quick_ratio()
+            if quick_score < 0.8 or quick_score < best_score:
+                continue
             score = SequenceMatcher(None, sigs["similarity"], other_sigs["similarity"]).ratio()
             if score >= 0.80 and score > best_score:
                 best_score = score
